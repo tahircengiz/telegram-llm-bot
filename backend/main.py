@@ -76,8 +76,12 @@ def system_status(db: Session = Depends(get_db)):
 
 
 # Serve frontend if available
-if settings.frontend_dir and os.path.exists(settings.frontend_dir):
-    app.mount("/", StaticFiles(directory=settings.frontend_dir, html=True), name="frontend")
+frontend_path = settings.frontend_dir or "/app/frontend/dist"
+if os.path.exists(frontend_path):
+    print(f"✅ Serving frontend from: {frontend_path}")
+    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+else:
+    print(f"⚠️  Frontend not found at: {frontend_path}")
 
 
 if __name__ == "__main__":
