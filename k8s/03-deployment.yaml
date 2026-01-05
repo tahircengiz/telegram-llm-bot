@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: bot
-          image: YOUR_REGISTRY/telegram-llm-bot:latest
+          image: ghcr.io/tacengiz/telegram-llm-bot:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
