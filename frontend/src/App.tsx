@@ -17,6 +17,32 @@ const theme = createTheme({
     secondary: {
       main: '#f50057',
     },
+    background: {
+      default: '#0a1929',
+      paper: 'rgba(15, 23, 42, 0.8)',
+    },
+  },
+  typography: {
+    fontFamily: '"Inter", -apple-system, BlinkM SystemFont, "Segoe UI", Roboto, sans-serif',
+  },
+  components: {
+    MuiCard: {
+      styleOverrides: {
+        root: {
+          backdropFilter: 'blur(20px)',
+          borderRadius: 16,
+        },
+      },
+    },
+    MuiButton: {
+      styleOverrides: {
+        root: {
+          borderRadius: 8,
+          textTransform: 'none',
+          fontWeight: 600,
+        },
+      },
+    },
   },
 })
 
@@ -25,7 +51,7 @@ function App() {
     <ThemeProvider theme={theme}>
       <CssBaseline />
       <Router>
-        <Box sx={{ display: 'flex' }}>
+        <Box sx={{ display: 'flex', minHeight: '100vh' }}>
           <Sidebar />
           <Box component="main" sx={{ flexGrow: 1, p: 3, mt: 8 }}>
             <Routes>
