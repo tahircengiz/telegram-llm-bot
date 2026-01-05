@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: telegram-llm-bot
+  labels:
+    name: telegram-llm-bot
+    managed-by: argocd

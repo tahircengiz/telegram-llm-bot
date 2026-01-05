@@ -17,7 +17,7 @@ export default function HomeAssistant() {
     api_token: '',
     dry_run_mode: true,
   })
-  const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null)
 
   const handleSave = () => {
     setMessage({ type: 'success', text: 'HA config saved! (Backend integration pending)' })
