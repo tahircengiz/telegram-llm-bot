@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 import os
 
@@ -26,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
+# Include routers FIRST (before static files)
 app.include_router(providers.router)
 app.include_router(telegram.router)
 
@@ -75,11 +76,28 @@ def system_status(db: Session = Depends(get_db)):
     }
 
 
-# Serve frontend if available
+# Serve frontend - MUST be after all API routes
 frontend_path = settings.frontend_dir or "/app/frontend/dist"
 if os.path.exists(frontend_path):
     print(f"✅ Serving frontend from: {frontend_path}")
-    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+    
+    # Mount static assets (JS, CSS, images)
+    app.mount("/assets", StaticFiles(directory=f"{frontend_path}/assets"), name="assets")
+    
+    # Catch-all route for SPA (MUST be last)
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Serve SPA for all non-API routes"""
+        # Don't serve for API routes (already handled above)
+        if full_path.startswith("api/"):
+            return None
+        
+        # Serve index.html for all other routes (SPA routing)
+        index_file = os.path.join(frontend_path, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file)
+        
+        return {"detail": "Frontend not found"}
 else:
     print(f"⚠️  Frontend not found at: {frontend_path}")
 
