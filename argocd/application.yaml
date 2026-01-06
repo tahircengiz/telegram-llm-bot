@@ -9,8 +9,8 @@ spec:
   project: default
 
   source:
-    repoURL: https://github.com/tacengiz/telegram-llm-bot.git
-    targetRevision: main
+    repoURL: https://github.com/tahircengiz/telegram-llm-bot.git
+    targetRevision: master
     path: k8s
 
   destination:
