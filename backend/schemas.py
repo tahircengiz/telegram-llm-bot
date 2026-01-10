@@ -122,3 +122,20 @@ class TelegramConfigResponse(BaseModel):
 class TelegramTestMessage(BaseModel):
     chat_id: str = Field(description="Telegram chat ID to send test message")
     message: str = Field(default="🤖 Test message from Telegram LLM Bot!", max_length=500)
+
+# Home Assistant Schemas
+class HomeAssistantConfigBase(BaseModel):
+    base_url: str = Field(default="")
+    api_token: str = Field(default="")
+    dry_run: bool = Field(default=True)
+
+
+class HomeAssistantConfigUpdate(HomeAssistantConfigBase):
+    pass
+
+
+class HomeAssistantConfigResponse(HomeAssistantConfigBase):
+    id: int
+    api_token: str = "***"  # Masked for security
+    base_url: str
+    dry_run: bool

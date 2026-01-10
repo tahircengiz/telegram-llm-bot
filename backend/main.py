@@ -8,7 +8,15 @@ import os
 from .config import settings
 from .database import init_db, get_db
 from .models import LLMProvider
-from .routers import providers, telegram
+from .routers import providers, telegram, home_assistant
+from .services import bot_manager
+from .utils.logger import setup_logging
+import asyncio
+import logging
+
+# Setup logging
+setup_logging(level="INFO" if not settings.debug else "DEBUG", use_json=False)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.app_name,
@@ -30,6 +38,7 @@ app.add_middleware(
 # Include routers FIRST (before static files)
 app.include_router(providers.router)
 app.include_router(telegram.router)
+app.include_router(home_assistant.router)
 
 
 @app.on_event("startup")
@@ -51,6 +60,23 @@ async def startup_event():
                 )
                 db.add(provider)
         db.commit()
+        
+        # Start Telegram bot if configured (using BotManager)
+        from .models import TelegramConfig
+        telegram_config = db.query(TelegramConfig).first()
+        if telegram_config and telegram_config.enabled and telegram_config.bot_token:
+            logger.info("Starting Telegram bot on startup...")
+            try:
+                manager = bot_manager.get_bot_manager()
+                bot = await manager.get_bot(db)
+                if bot:
+                    logger.info("✅ Telegram bot started successfully via BotManager")
+                else:
+                    logger.error("❌ Failed to start Telegram bot")
+            except Exception as e:
+                logger.error(f"Error starting Telegram bot: {e}", exc_info=True)
+        else:
+            logger.info("Telegram bot not configured or disabled, skipping startup")
     finally:
         db.close()
 

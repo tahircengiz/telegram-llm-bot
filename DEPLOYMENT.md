@@ -255,6 +255,46 @@ kubectl logs <pod-name> -n telegram-llm-bot --previous
 5. ⏳ Test admin panel features
 6. ⏳ Monitor first auto-deployment
 
+## 🆕 Yeni Özellikler (Son Güncelleme)
+
+### İyileştirmeler
+
+1. **Bot Instance Management:**
+   - BotManager servisi ile dependency injection
+   - Daha iyi lifecycle yönetimi
+   - Otomatik restart mekanizması
+
+2. **Error Handling:**
+   - Retry mekanizması (exponential backoff)
+   - Daha detaylı hata mesajları
+   - Graceful error handling
+
+3. **Rate Limiting:**
+   - Token bucket algoritması
+   - Chat ID bazlı rate limiting
+   - Configurable rate limits
+
+4. **Structured Logging:**
+   - JSON format logging desteği
+   - Daha iyi log yönetimi
+   - Production-ready logging
+
+5. **Webhook Desteği:**
+   - Production için webhook modu
+   - Webhook manager servisi
+   - Secret token desteği
+
+6. **Otomatik Başlatma:**
+   - Startup event'te otomatik bot başlatma
+   - Config değişikliklerinde otomatik restart
+
+### Test
+
+Test için `TESTING.md` dosyasına bakın:
+```bash
+cat TESTING.md
+```
+
 ---
 
 ## 📚 Resources
