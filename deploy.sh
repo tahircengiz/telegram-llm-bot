@@ -33,28 +33,48 @@ backup_previous_version() {
 
 # Function: Validate git pull
 validate_git_pull() {
-    echo -e "${GREEN}[2/7] Pulling latest changes...${NC}"
+    echo -e "${GREEN}[2/7] Pulling latest changes from GitHub...${NC}"
     
     cd /root/telegram-llm-bot
     
-    # Get current hash
-    CURRENT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-    echo "Current hash: $CURRENT_HASH" | tee -a "$LOG_FILE"
-    
-    if ! git pull origin master 2>&1 | tee -a "$LOG_FILE"; then
-        echo -e "${RED}❌ Git pull failed - aborting deployment${NC}" | tee -a "$LOG_FILE"
+    # Check if it's a git repository
+    if [ ! -d .git ]; then
+        echo -e "${RED}❌ Not a git repository. Please clone the repository first.${NC}" | tee -a "$LOG_FILE"
         exit 1
     fi
     
-    NEW_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-    echo "New hash: $NEW_HASH" | tee -a "$LOG_FILE"
-    
-    if [ "$CURRENT_HASH" = "$NEW_HASH" ]; then
-        echo -e "${YELLOW}⚠️  No new changes detected${NC}" | tee -a "$LOG_FILE"
-        exit 0
+    # Fetch latest changes
+    echo "Fetching from origin..." | tee -a "$LOG_FILE"
+    if ! git fetch origin master 2>&1 | tee -a "$LOG_FILE"; then
+        echo -e "${RED}❌ Git fetch failed - aborting deployment${NC}" | tee -a "$LOG_FILE"
+        exit 1
     fi
     
+    # Get current hash
+    CURRENT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+    NEW_HASH=$(git rev-parse origin/master 2>/dev/null || echo "unknown")
+    
+    echo "Current hash: $CURRENT_HASH" | tee -a "$LOG_FILE"
+    echo "Latest hash: $NEW_HASH" | tee -a "$LOG_FILE"
+    
+    if [ "$CURRENT_HASH" = "$NEW_HASH" ]; then
+        echo -e "${YELLOW}⚠️  No new changes detected - already on latest version${NC}" | tee -a "$LOG_FILE"
+        # Don't exit, continue with build in case of manual deployment
+        return 0
+    fi
+    
+    # Reset to latest version
+    echo "Resetting to latest version..." | tee -a "$LOG_FILE"
+    if ! git reset --hard origin/master 2>&1 | tee -a "$LOG_FILE"; then
+        echo -e "${RED}❌ Git reset failed - aborting deployment${NC}" | tee -a "$LOG_FILE"
+        exit 1
+    fi
+    
+    # Clean untracked files
+    git clean -fd 2>&1 | tee -a "$LOG_FILE"
+    
     echo -e "${GREEN}✅ Git pull successful${NC}" | tee -a "$LOG_FILE"
+    echo "Updated to commit: $(git log -1 --oneline)" | tee -a "$LOG_FILE"
 }
 
 # Function: Build new image

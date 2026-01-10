@@ -1,132 +1,120 @@
 # Telegram LLM Bot - Deployment Guide
 
-## 🚀 Production Deployment (Proxmox Server)
+## 🚀 Production Deployment (LXC Container)
 
 ### Sunucu Bilgileri
 
-- **Sunucu:** 192.168.7.222 (Proxmox)
+- **Sunucu:** 192.168.7.62 (LXC Container on Proxmox)
+- **SSH User:** root
+- **SSH Key:** ~/.ssh/id_ed25519
 - **Application URL:** http://192.168.7.62:8000
 - **Deployment Method:** Docker + deploy.sh script
 - **Repository:** https://github.com/tahircengiz/telegram-llm-bot
+- **Branch:** master
+
+### Bot Bilgileri
+
+- **Bot Token:** 8598475911:AAE6koTqfhoQanydNh7lL5aAd4CHxMcQAY
+- **Chat ID:** -1003541895181
+- **Database:** /root/bot-data (SQLite)
 
 ---
 
-## 📋 Hızlı Deployment
+## 📋 Hızlı Deployment (GitHub'dan)
 
-### 1. Sunucuya Bağlan
+### Yerel Makineden Deployment
+
+En kolay yöntem: `deploy_from_github.sh` script'ini kullanın:
 
 ```bash
-ssh root@192.168.7.222
+cd telegram-llm-bot
+./deploy_from_github.sh
 ```
 
-### 2. Deployment Script'ini Çalıştır
+Bu script otomatik olarak:
+- ✅ SSH bağlantısını test eder
+- ✅ Sunucuya bağlanır
+- ✅ GitHub'dan güncel kodu çeker
+- ✅ Deployment script'ini çalıştırır
+- ✅ Health check yapar
+
+### Manuel Deployment (Sunucuya Bağlanarak)
 
 ```bash
+# 1. Sunucuya bağlan
+ssh -i ~/.ssh/id_ed25519 root@192.168.7.62
+
+# 2. Proje dizinine git (veya clone et)
 cd /root/telegram-llm-bot
+
+# Eğer dizin yoksa:
+# git clone https://github.com/tahircengiz/telegram-llm-bot.git /root/telegram-llm-bot
+# cd /root/telegram-llm-bot
+
+# 3. Son değişiklikleri çek
+git fetch origin master
+git reset --hard origin/master
+git clean -fd
+
+# 4. Deployment script'ini çalıştır
 ./deploy.sh
 ```
 
-Deployment script otomatik olarak:
-- ✅ Mevcut versiyonu yedekler
-- ✅ Git'ten son değişiklikleri çeker
-- ✅ Yeni Docker image build eder
-- ✅ Zero-downtime deployment yapar
-- ✅ Health check yapar
-- ✅ Başarısız olursa rollback yapar
-
-### 3. Deployment Durumunu Kontrol Et
-
-```bash
-# Container durumu
-docker ps | grep telegram-llm-bot
-
-# Logs
-docker logs -f telegram-llm-bot
-
-# Health check
-curl http://localhost:8000/api/health
-```
-
 ---
 
-## 🔧 Manuel Deployment
+## 🔧 Deployment Script Detayları
 
-Eğer script kullanmak istemiyorsanız:
+### `deploy.sh` (Sunucuda Çalışan)
 
-### 1. Git Pull
+Bu script sunucuda çalışır ve şunları yapar:
 
-```bash
-cd /root/telegram-llm-bot
-git pull origin master
-```
-
-### 2. Docker Build
-
-```bash
-docker build -t telegram-llm-bot:latest .
-```
-
-### 3. Container'ı Durdur ve Yeniden Başlat
-
-```bash
-# Eski container'ı durdur
-docker stop telegram-llm-bot
-docker rm telegram-llm-bot
-
-# Yeni container'ı başlat
-docker run -d \
-  --name telegram-llm-bot \
-  -p 8000:8000 \
-  -v /root/bot-data:/app/data \
-  --restart unless-stopped \
-  telegram-llm-bot:latest
-```
-
----
-
-## 📊 Deployment Script Detayları
-
-`deploy.sh` script'i şu özelliklere sahip:
-
-### Özellikler
-
-1. **Backup:** Mevcut versiyonu yedekler
-2. **Git Pull:** Son değişiklikleri çeker
+1. **Backup:** Mevcut Docker image'ı yedekler
+2. **Git Pull:** GitHub'dan son değişiklikleri çeker
 3. **Build:** Yeni Docker image build eder
-4. **Zero-Downtime:** Kesintisiz deployment
+4. **Zero-Downtime Deploy:** Kesintisiz deployment
 5. **Health Check:** Container sağlığını kontrol eder
 6. **Rollback:** Başarısız olursa otomatik geri alır
-7. **Logging:** Tüm işlemler `/root/deploy.log` dosyasına kaydedilir
 
-### Script Çalışma Adımları
+### `deploy_from_github.sh` (Yerel Makineden Çalışan)
 
-1. **Backup:** Mevcut image'ı `telegram-llm-bot:backup` olarak tagler
-2. **Git Pull:** Master branch'ten son değişiklikleri çeker
-3. **Build:** Yeni Docker image build eder (retry logic ile)
-4. **Zero-Downtime Deploy:**
-   - Yeni container'ı 8001 portunda başlatır
-   - Health check yapar
-   - Başarılıysa eski container'ı durdurur
-   - Yeni container'ı 8000 portuna taşır
-5. **Final Health Check:** 60 saniye boyunca kontrol eder
-6. **Cleanup:** Eski image'ları temizler
+Bu script yerel makinenizden çalışır ve:
 
-### Rollback
+1. SSH bağlantısını test eder
+2. Sunucuya bağlanır
+3. GitHub'dan güncel kodu çeker
+4. `deploy.sh` script'ini çalıştırır
+5. Deployment durumunu kontrol eder
 
-Eğer deployment başarısız olursa:
+---
 
-```bash
-# Manuel rollback
-docker stop telegram-llm-bot
-docker rm telegram-llm-bot
-docker tag telegram-llm-bot:backup telegram-llm-bot:latest
-docker run -d \
-  --name telegram-llm-bot \
-  -p 8000:8000 \
-  -v /root/bot-data:/app/data \
-  --restart unless-stopped \
-  telegram-llm-bot:latest
-```
+## 📊 Deployment Adımları
+
+### 1. Backup
+- Mevcut image `telegram-llm-bot:backup` olarak taglenir
+- Timestamp'li backup da oluşturulur
+
+### 2. Git Pull
+- GitHub'dan `master` branch çekilir
+- `git reset --hard origin/master` ile güncel versiyona geçilir
+- Untracked dosyalar temizlenir
+
+### 3. Build
+- Docker image build edilir
+- Retry logic ile 3 deneme hakkı var
+- Build logları `/root/deploy.log` dosyasına yazılır
+
+### 4. Zero-Downtime Deploy
+- Yeni container 8001 portunda başlatılır
+- Health check yapılır
+- Başarılıysa eski container durdurulur
+- Yeni container 8000 portuna taşınır
+
+### 5. Health Check
+- 60 saniye boyunca health check yapılır
+- `/api/health` endpoint'i kontrol edilir
+
+### 6. Cleanup
+- 24 saatten eski image'lar temizlenir
 
 ---
 
@@ -163,6 +151,9 @@ curl http://192.168.7.62:8000/api/health
 
 # Status endpoint
 curl http://192.168.7.62:8000/api/status
+
+# Bot config
+curl http://192.168.7.62:8000/api/telegram/config
 ```
 
 ### Container Durumu
@@ -200,8 +191,7 @@ docker images | grep telegram-llm-bot
 ```bash
 # Port kullanımını kontrol et
 netstat -tulpn | grep 8000
-
-# Veya
+# veya
 ss -tulpn | grep 8000
 ```
 
@@ -229,19 +219,32 @@ cd /root/telegram-llm-bot
 docker build --no-cache -t telegram-llm-bot:latest .
 ```
 
+### Git Pull Sorunları
+
+```bash
+# Git durumunu kontrol et
+cd /root/telegram-llm-bot
+git status
+
+# Remote'u kontrol et
+git remote -v
+
+# Manuel pull
+git fetch origin master
+git reset --hard origin/master
+```
+
 ---
 
 ## 🔄 Güncelleme Süreci
 
 ### Otomatik Güncelleme (Önerilen)
 
-```bash
-# Sunucuya bağlan
-ssh root@192.168.7.222
+Yerel makinenizden:
 
-# Deployment script'ini çalıştır
-cd /root/telegram-llm-bot
-./deploy.sh
+```bash
+cd telegram-llm-bot
+./deploy_from_github.sh
 ```
 
 ### Manuel Güncelleme
@@ -253,9 +256,14 @@ cd /root/telegram-llm-bot
    git push origin master
    ```
 
-2. **Sunucuda deployment yap:**
+2. **Deployment yap:**
    ```bash
-   ssh root@192.168.7.222
+   ./deploy_from_github.sh
+   ```
+
+   Veya sunucuda:
+   ```bash
+   ssh -i ~/.ssh/id_ed25519 root@192.168.7.62
    cd /root/telegram-llm-bot
    ./deploy.sh
    ```
@@ -272,8 +280,8 @@ cd /root/telegram-llm-bot
 
 2. **Telegram Bot Yapılandırması:**
    - Telegram Settings sayfasına git
-   - Bot token ekle (BotFather'dan)
-   - Chat ID ekle (JSON format: `["123456789"]`)
+   - Bot token: `8598475911:AAE6koTqfhoQanydNh7lL5aAd4CHxMcQAY`
+   - Chat ID: `-1003541895181` (JSON format: `["-1003541895181"]`)
    - Rate limit ayarla (varsayılan: 10 mesaj/dakika)
    - "Enable Bot" switch'ini aç
    - "Save Configuration" butonuna tıkla
@@ -282,15 +290,6 @@ cd /root/telegram-llm-bot
    - Providers sayfasına git
    - Ollama/OpenAI/Gemini seç ve yapılandır
    - Aktif provider'ı seç
-
-### Chat ID Nasıl Bulunur?
-
-1. Bot'a Telegram'dan `/start` gönder
-2. Tarayıcıda şu URL'yi aç:
-   ```
-   https://api.telegram.org/bot<TOKEN>/getUpdates
-   ```
-3. `chat.id` değerini bul ve admin panel'e ekle
 
 ---
 
@@ -305,24 +304,13 @@ ufw allow 22/tcp  # SSH
 ufw enable
 ```
 
-### SSL/HTTPS (Opsiyonel)
+### SSH Key
 
-Nginx reverse proxy ile SSL eklenebilir:
+SSH key'inizin doğru yerde olduğundan emin olun:
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name your-domain.com;
-    
-    ssl_certificate /path/to/cert.pem;
-    ssl_certificate_key /path/to/key.pem;
-    
-    location / {
-        proxy_pass http://localhost:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
+```bash
+ls -la ~/.ssh/id_ed25519
+chmod 600 ~/.ssh/id_ed25519
 ```
 
 ---
@@ -383,13 +371,6 @@ gunzip -c /root/backups/telegram-llm-bot-20240101.tar.gz | docker load
 6. **Otomatik Başlatma:**
    - Startup event'te otomatik bot başlatma
    - Config değişikliklerinde otomatik restart
-
-### Test
-
-Test için `TESTING.md` dosyasına bakın:
-```bash
-cat TESTING.md
-```
 
 ---
 
