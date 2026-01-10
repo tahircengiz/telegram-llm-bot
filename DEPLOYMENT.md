@@ -1,259 +1,355 @@
-# Telegram LLM Bot - GitOps Deployment Guide
+# Telegram LLM Bot - Deployment Guide
 
-## 🚀 Quick Setup
+## 🚀 Production Deployment (Proxmox Server)
 
-### 1. Create GitHub Repository
+### Sunucu Bilgileri
 
-```bash
-# Create private repo on GitHub
-gh repo create telegram-llm-bot --private --description "Telegram LLM Bot with Admin Panel"
-
-# Or create manually at: https://github.com/new
-# Name: telegram-llm-bot
-# Visibility: Private
-```
-
-### 2. Push Code to GitHub
-
-```bash
-cd /Users/tacengiz/Documents/projects/prj_Kahya/telegram-llm-bot
-
-# Add remote
-git remote add origin https://github.com/tacengiz/telegram-llm-bot.git
-
-# Push
-git push -u origin main
-```
-
-### 3. Verify GitHub Actions
-
-```bash
-# Go to: https://github.com/tacengiz/telegram-llm-bot/actions
-# First workflow will auto-trigger
-# Wait for Docker build to complete (~3-5 min)
-```
-
-### 4. Deploy to ArgoCD
-
-```bash
-# Apply ArgoCD application
-kubectl apply -f argocd/application.yaml -n argocd
-
-# Or via ArgoCD UI:
-# URL: https://192.168.7.170:8088
-# User: admin
-# Password: 47-6KC1XjWfRvz4K
-# Click "New App" → Use argocd/application.yaml values
-```
-
-### 5. Monitor Deployment
-
-```bash
-# Watch ArgoCD sync
-argocd app get telegram-llm-bot --refresh
-
-# Watch pods
-kubectl get pods -n telegram-llm-bot -w
-
-# Check logs
-kubectl logs -n telegram-llm-bot deployment/telegram-llm-bot
-```
-
-### 6. Access Application
-
-- **Frontend:** http://192.168.7.170:30800
-- **API Docs:** http://192.168.7.170:30800/api/docs
-- **Health:** http://192.168.7.170:30800/api/health
+- **Sunucu:** 192.168.7.222 (Proxmox)
+- **Application URL:** http://192.168.7.62:8000
+- **Deployment Method:** Docker + deploy.sh script
+- **Repository:** https://github.com/tahircengiz/telegram-llm-bot
 
 ---
 
-## 📋 Architecture
+## 📋 Hızlı Deployment
 
-### CI Pipeline (GitHub Actions)
-```
-Push to main
-  ↓
-GitHub Actions triggers
-  ↓
-Multi-stage Docker build (frontend + backend)
-  ↓
-Push to ghcr.io/tacengiz/telegram-llm-bot:latest
-  ↓
-Push to ghcr.io/tacengiz/telegram-llm-bot:main-sha-xxxxx
+### 1. Sunucuya Bağlan
+
+```bash
+ssh root@192.168.7.222
 ```
 
-### CD Pipeline (ArgoCD)
+### 2. Deployment Script'ini Çalıştır
+
+```bash
+cd /root/telegram-llm-bot
+./deploy.sh
 ```
-ArgoCD monitors Git repo
-  ↓
-Detects changes in k8s/ folder
-  ↓
-Auto-syncs to K3s cluster
-  ↓
-Creates/updates namespace telegram-llm-bot
-  ↓
-Deploys pods with latest image from GHCR
-  ↓
-Self-heals if manual changes detected
+
+Deployment script otomatik olarak:
+- ✅ Mevcut versiyonu yedekler
+- ✅ Git'ten son değişiklikleri çeker
+- ✅ Yeni Docker image build eder
+- ✅ Zero-downtime deployment yapar
+- ✅ Health check yapar
+- ✅ Başarısız olursa rollback yapar
+
+### 3. Deployment Durumunu Kontrol Et
+
+```bash
+# Container durumu
+docker ps | grep telegram-llm-bot
+
+# Logs
+docker logs -f telegram-llm-bot
+
+# Health check
+curl http://localhost:8000/api/health
 ```
 
 ---
 
-## 🔧 Common Operations
+## 🔧 Manuel Deployment
 
-### Make Code Changes
+Eğer script kullanmak istemiyorsanız:
+
+### 1. Git Pull
+
 ```bash
-# Edit files
-vim frontend/src/App.tsx
-
-# Commit and push
-git add .
-git commit -m "feat: update UI"
-git push
-
-# Automatic:
-# 1. GitHub Actions builds new image
-# 2. ArgoCD detects change
-# 3. Deploys to K3s
-# 4. Pods restart with new image
+cd /root/telegram-llm-bot
+git pull origin master
 ```
 
-### Manual Sync (if needed)
-```bash
-# Via CLI
-argocd app sync telegram-llm-bot
+### 2. Docker Build
 
-# Via UI
-# Go to ArgoCD UI → Apps → telegram-llm-bot → SYNC
+```bash
+docker build -t telegram-llm-bot:latest .
 ```
+
+### 3. Container'ı Durdur ve Yeniden Başlat
+
+```bash
+# Eski container'ı durdur
+docker stop telegram-llm-bot
+docker rm telegram-llm-bot
+
+# Yeni container'ı başlat
+docker run -d \
+  --name telegram-llm-bot \
+  -p 8000:8000 \
+  -v /root/bot-data:/app/data \
+  --restart unless-stopped \
+  telegram-llm-bot:latest
+```
+
+---
+
+## 📊 Deployment Script Detayları
+
+`deploy.sh` script'i şu özelliklere sahip:
+
+### Özellikler
+
+1. **Backup:** Mevcut versiyonu yedekler
+2. **Git Pull:** Son değişiklikleri çeker
+3. **Build:** Yeni Docker image build eder
+4. **Zero-Downtime:** Kesintisiz deployment
+5. **Health Check:** Container sağlığını kontrol eder
+6. **Rollback:** Başarısız olursa otomatik geri alır
+7. **Logging:** Tüm işlemler `/root/deploy.log` dosyasına kaydedilir
+
+### Script Çalışma Adımları
+
+1. **Backup:** Mevcut image'ı `telegram-llm-bot:backup` olarak tagler
+2. **Git Pull:** Master branch'ten son değişiklikleri çeker
+3. **Build:** Yeni Docker image build eder (retry logic ile)
+4. **Zero-Downtime Deploy:**
+   - Yeni container'ı 8001 portunda başlatır
+   - Health check yapar
+   - Başarılıysa eski container'ı durdurur
+   - Yeni container'ı 8000 portuna taşır
+5. **Final Health Check:** 60 saniye boyunca kontrol eder
+6. **Cleanup:** Eski image'ları temizler
 
 ### Rollback
+
+Eğer deployment başarısız olursa:
+
 ```bash
-# Via Git
-git revert HEAD
-git push
-
-# ArgoCD will auto-sync to previous version
-
-# Or via ArgoCD UI
-# History → Select previous revision → SYNC TO
-```
-
-### View Logs
-```bash
-# Application logs
-kubectl logs -f deployment/telegram-llm-bot -n telegram-llm-bot
-
-# ArgoCD sync logs
-argocd app logs telegram-llm-bot --follow
+# Manuel rollback
+docker stop telegram-llm-bot
+docker rm telegram-llm-bot
+docker tag telegram-llm-bot:backup telegram-llm-bot:latest
+docker run -d \
+  --name telegram-llm-bot \
+  -p 8000:8000 \
+  -v /root/bot-data:/app/data \
+  --restart unless-stopped \
+  telegram-llm-bot:latest
 ```
 
 ---
 
-## 🔐 Security
+## 🔍 Monitoring ve Logs
 
-### GitHub Container Registry
-- Packages are private by default
-- K3s needs imagePullSecret for private images
-- Currently using public GHCR (no credential needed)
-- To make private: Add imagePullSecret to deployment
+### Container Logs
 
-### Image Pull Secret (if private)
 ```bash
-# Create secret
-kubectl create secret docker-registry ghcr-secret \
-  --docker-server=ghcr.io \
-  --docker-username=tacengiz \
-  --docker-password=<GITHUB_PAT> \
-  --docker-email=your@email.com \
-  -n telegram-llm-bot
+# Real-time logs
+docker logs -f telegram-llm-bot
 
-# Add to deployment spec
-spec:
-  template:
-    spec:
-      imagePullSecrets:
-      - name: ghcr-secret
+# Son 100 satır
+docker logs --tail 100 telegram-llm-bot
+
+# Belirli bir tarihten itibaren
+docker logs --since 2024-01-01T00:00:00 telegram-llm-bot
+```
+
+### Deployment Logs
+
+```bash
+# Deployment script logları
+tail -f /root/deploy.log
+
+# Son deployment
+grep "SUCCESS" /root/deploy.log | tail -1
+```
+
+### Health Check
+
+```bash
+# API health check
+curl http://192.168.7.62:8000/api/health
+
+# Status endpoint
+curl http://192.168.7.62:8000/api/status
+```
+
+### Container Durumu
+
+```bash
+# Container stats
+docker stats telegram-llm-bot
+
+# Container detayları
+docker inspect telegram-llm-bot
+
+# Port mapping
+docker port telegram-llm-bot
 ```
 
 ---
 
-## 📊 Monitoring
+## 🐛 Sorun Giderme
 
-### ArgoCD Health Status
+### Container Başlamıyor
+
 ```bash
-# CLI
-argocd app get telegram-llm-bot
+# Logs kontrol
+docker logs telegram-llm-bot
 
-# Returns:
-# - Sync Status: Synced/OutOfSync
-# - Health Status: Healthy/Progressing/Degraded
-# - Last Sync: timestamp
+# Container durumu
+docker ps -a | grep telegram-llm-bot
+
+# Image kontrol
+docker images | grep telegram-llm-bot
 ```
 
-### Application Status
+### Port Çakışması
+
 ```bash
-# Pods
-kubectl get pods -n telegram-llm-bot
+# Port kullanımını kontrol et
+netstat -tulpn | grep 8000
 
-# Services
-kubectl get svc -n telegram-llm-bot
-
-# PVCs
-kubectl get pvc -n telegram-llm-bot
+# Veya
+ss -tulpn | grep 8000
 ```
 
----
+### Database Sorunları
 
-## 🐛 Troubleshooting
-
-### Image Pull Errors
 ```bash
-# Check events
-kubectl describe pod <pod-name> -n telegram-llm-bot
+# Database dosyasını kontrol et
+ls -lh /root/bot-data/bot.db
 
-# Common fixes:
-# 1. Ensure GitHub Actions completed successfully
-# 2. Check image exists: https://github.com/tacengiz?tab=packages
-# 3. Verify imagePullPolicy in deployment
+# Database backup
+cp /root/bot-data/bot.db /root/bot-data/bot.db.backup
+
+# Database permissions
+chmod 644 /root/bot-data/bot.db
 ```
 
-### ArgoCD Not Syncing
+### Build Hataları
+
 ```bash
-# Check app status
-argocd app get telegram-llm-bot
+# Build cache temizle
+docker builder prune -a
 
-# Force refresh
-argocd app get telegram-llm-bot --refresh --hard
-
-# Manual sync
-argocd app sync telegram-llm-bot --force
-```
-
-### Pod CrashLoopBackOff
-```bash
-# Check logs
-kubectl logs <pod-name> -n telegram-llm-bot
-
-# Check previous logs
-kubectl logs <pod-name> -n telegram-llm-bot --previous
-
-# Common issues:
-# - Database migration errors
-# - Missing environment variables
-# - Frontend build failures
+# Yeniden build
+cd /root/telegram-llm-bot
+docker build --no-cache -t telegram-llm-bot:latest .
 ```
 
 ---
 
-## 🎯 Next Steps
+## 🔄 Güncelleme Süreci
 
-1. ✅ Push code to GitHub
-2. ✅ Verify GitHub Actions build
-3. ✅ Apply ArgoCD application
-4. ⏳ Configure Telegram bot token
-5. ⏳ Test admin panel features
-6. ⏳ Monitor first auto-deployment
+### Otomatik Güncelleme (Önerilen)
+
+```bash
+# Sunucuya bağlan
+ssh root@192.168.7.222
+
+# Deployment script'ini çalıştır
+cd /root/telegram-llm-bot
+./deploy.sh
+```
+
+### Manuel Güncelleme
+
+1. **Kod değişikliklerini commit ve push et:**
+   ```bash
+   git add .
+   git commit -m "feat: your changes"
+   git push origin master
+   ```
+
+2. **Sunucuda deployment yap:**
+   ```bash
+   ssh root@192.168.7.222
+   cd /root/telegram-llm-bot
+   ./deploy.sh
+   ```
+
+---
+
+## 📝 Bot Yapılandırması
+
+### İlk Kurulum
+
+1. **Admin Panel'e Eriş:**
+   - URL: http://192.168.7.62:8000
+   - API Docs: http://192.168.7.62:8000/api/docs
+
+2. **Telegram Bot Yapılandırması:**
+   - Telegram Settings sayfasına git
+   - Bot token ekle (BotFather'dan)
+   - Chat ID ekle (JSON format: `["123456789"]`)
+   - Rate limit ayarla (varsayılan: 10 mesaj/dakika)
+   - "Enable Bot" switch'ini aç
+   - "Save Configuration" butonuna tıkla
+
+3. **LLM Provider Yapılandırması:**
+   - Providers sayfasına git
+   - Ollama/OpenAI/Gemini seç ve yapılandır
+   - Aktif provider'ı seç
+
+### Chat ID Nasıl Bulunur?
+
+1. Bot'a Telegram'dan `/start` gönder
+2. Tarayıcıda şu URL'yi aç:
+   ```
+   https://api.telegram.org/bot<TOKEN>/getUpdates
+   ```
+3. `chat.id` değerini bul ve admin panel'e ekle
+
+---
+
+## 🔐 Güvenlik
+
+### Firewall
+
+```bash
+# Sadece gerekli portları aç
+ufw allow 8000/tcp
+ufw allow 22/tcp  # SSH
+ufw enable
+```
+
+### SSL/HTTPS (Opsiyonel)
+
+Nginx reverse proxy ile SSL eklenebilir:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name your-domain.com;
+    
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+    
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+---
+
+## 📊 Backup ve Restore
+
+### Backup
+
+```bash
+# Database backup
+cp /root/bot-data/bot.db /root/backups/bot.db.$(date +%Y%m%d_%H%M%S)
+
+# Docker image backup
+docker save telegram-llm-bot:latest | gzip > /root/backups/telegram-llm-bot-$(date +%Y%m%d).tar.gz
+```
+
+### Restore
+
+```bash
+# Database restore
+cp /root/backups/bot.db.20240101_120000 /root/bot-data/bot.db
+
+# Docker image restore
+gunzip -c /root/backups/telegram-llm-bot-20240101.tar.gz | docker load
+```
+
+---
 
 ## 🆕 Yeni Özellikler (Son Güncelleme)
 
@@ -297,9 +393,62 @@ cat TESTING.md
 
 ---
 
-## 📚 Resources
+## 📚 Faydalı Komutlar
 
-- **GitHub Actions:** https://github.com/tacengiz/telegram-llm-bot/actions
-- **GHCR Packages:** https://github.com/tacengiz?tab=packages
-- **ArgoCD UI:** https://192.168.7.170:8088
-- **Application:** http://192.168.7.170:30800
+### Container Yönetimi
+
+```bash
+# Container'ı durdur
+docker stop telegram-llm-bot
+
+# Container'ı başlat
+docker start telegram-llm-bot
+
+# Container'ı yeniden başlat
+docker restart telegram-llm-bot
+
+# Container'ı sil (data korunur)
+docker rm telegram-llm-bot
+```
+
+### Image Yönetimi
+
+```bash
+# Image listesi
+docker images | grep telegram-llm-bot
+
+# Eski image'ları temizle
+docker image prune -f --filter "until=24h"
+
+# Tüm eski image'ları temizle
+docker image prune -a -f
+```
+
+### Volume Yönetimi
+
+```bash
+# Volume kontrol
+docker volume ls
+
+# Data dizini kontrol
+ls -lh /root/bot-data/
+```
+
+---
+
+## 🔗 Faydalı Linkler
+
+- **Application:** http://192.168.7.62:8000
+- **API Docs:** http://192.168.7.62:8000/api/docs
+- **Health Check:** http://192.168.7.62:8000/api/health
+- **GitHub Repository:** https://github.com/tahircengiz/telegram-llm-bot
+
+---
+
+## 📞 Destek
+
+Sorun yaşarsanız:
+1. Logs kontrol edin: `docker logs telegram-llm-bot`
+2. Health check yapın: `curl http://192.168.7.62:8000/api/health`
+3. Deployment loglarına bakın: `tail -f /root/deploy.log`
+4. `TESTING.md` dosyasındaki troubleshooting bölümüne bakın
