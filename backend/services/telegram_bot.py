@@ -39,6 +39,7 @@ class TelegramBotService:
         
         self.application = None
         self.ha_client: Optional[HomeAssistantClient] = None
+        self.ha_dry_run: bool = False
         self.rate_limiter = RateLimiter(max_requests=self.rate_limit, time_window=60)
         self.entity_cache = get_entity_cache()
     
@@ -57,9 +58,12 @@ class TelegramBotService:
         ha_config = db.query(HomeAssistantConfig).first()
         if ha_config and ha_config.base_url:
             self.ha_client = HomeAssistantClient(ha_config.base_url, ha_config.api_token)
-            logger.info(f"HA client initialized: {ha_config.base_url}")
+            self.ha_dry_run = getattr(ha_config, 'dry_run_mode', False)
+            logger.info(f"HA client initialized: {ha_config.base_url}, dry_run: {self.ha_dry_run}")
         else:
             self.ha_client = None
+            self.ha_dry_run = False
+            logger.warning("HA client not initialized - no config or base_url")
     
     async def _refresh_entity_cache(self):
         """Refresh entity cache from Home Assistant"""
@@ -351,23 +355,60 @@ HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_te
                             logger.error(f"Error validating entities: {e}")
                 
                 # Execute HA command if present
-                if ha_command and self.ha_client:
-                    try:
+                if ha_command:
+                    if not self.ha_client:
+                        logger.warning("HA command found but HA client not initialized")
+                        bot_response += "\n\n⚠️ Home Assistant yapılandırılmamış. Lütfen admin panel'den yapılandırın."
+                    elif self.ha_dry_run:
+                        # Dry run mode - just log, don't execute
                         entities = ha_command.get("entities", [])
                         action = ha_command.get("action")
-                        
-                        for entity_id in entities:
-                            if action == "on":
-                                await self.ha_client.turn_on(entity_id)
-                            elif action == "off":
-                                await self.ha_client.turn_off(entity_id)
-                            elif action == "set_temperature" and "temperature" in ha_command:
-                                await self.ha_client.set_temperature(entity_id, ha_command["temperature"])
-                        
-                        bot_response += "\n\n✅ Akıllı ev komutu çalıştırıldı."
-                    except Exception as e:
-                        logger.error(f"HA command error: {e}")
-                        bot_response += f"\n\n⚠️ Akıllı ev komutu başarısız: {str(e)}"
+                        logger.info(f"[DRY RUN] Would execute HA command: {action} on {entities}")
+                        bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {action} → {', '.join(entities)}"
+                    else:
+                        # Execute command
+                        try:
+                            entities = ha_command.get("entities", [])
+                            action = ha_command.get("action")
+                            
+                            logger.info(f"Executing HA command: {action} on entities: {entities}")
+                            
+                            success_count = 0
+                            error_messages = []
+                            
+                            for entity_id in entities:
+                                try:
+                                    if action == "on":
+                                        result = await self.ha_client.turn_on(entity_id)
+                                        logger.info(f"Successfully turned on {entity_id}: {result}")
+                                        success_count += 1
+                                    elif action == "off":
+                                        result = await self.ha_client.turn_off(entity_id)
+                                        logger.info(f"Successfully turned off {entity_id}: {result}")
+                                        success_count += 1
+                                    elif action == "set_temperature" and "temperature" in ha_command:
+                                        temp = ha_command["temperature"]
+                                        result = await self.ha_client.set_temperature(entity_id, temp)
+                                        logger.info(f"Successfully set temperature {temp} for {entity_id}: {result}")
+                                        success_count += 1
+                                    else:
+                                        logger.warning(f"Unknown action: {action}")
+                                        error_messages.append(f"Bilinmeyen işlem: {action}")
+                                except Exception as e:
+                                    logger.error(f"Error executing HA command for {entity_id}: {e}", exc_info=True)
+                                    error_messages.append(f"{entity_id}: {str(e)}")
+                            
+                            # Add result message
+                            if success_count > 0 and not error_messages:
+                                bot_response += f"\n\n✅ {success_count} komut başarıyla çalıştırıldı."
+                            elif success_count > 0:
+                                bot_response += f"\n\n⚠️ {success_count} komut çalıştırıldı, bazı hatalar: {', '.join(error_messages)}"
+                            else:
+                                bot_response += f"\n\n❌ Komut çalıştırılamadı: {', '.join(error_messages)}"
+                                
+                        except Exception as e:
+                            logger.error(f"HA command execution error: {e}", exc_info=True)
+                            bot_response += f"\n\n⚠️ Akıllı ev komutu başarısız: {str(e)}"
                 
                 # Send response (with retry)
                 async def send_with_retry():

@@ -1,10 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+import logging
 
 from ..database import get_db
 from ..models import HomeAssistantConfig
-from ..schemas import TestResponse, HomeAssistantConfigResponse
+from ..schemas import TestResponse, HomeAssistantConfigResponse, HomeAssistantConfigUpdate
 from ..services import ha_client
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/homeassistant", tags=["homeassistant"])
 
@@ -18,16 +21,24 @@ def get_ha_config(db: Session = Depends(get_db)):
         config = HomeAssistantConfig(
             base_url="",
             api_token="",
-            dry_run=True
+            dry_run_mode=True
         )
         db.add(config)
         db.commit()
         db.refresh(config)
     
-    return HomeAssistantConfigResponse.model_validate(config)
+    # Convert to response format (dry_run_mode -> dry_run)
+    response_data = {
+        "id": config.id,
+        "base_url": config.base_url,
+        "api_token": "***",  # Masked
+        "dry_run": config.dry_run_mode
+    }
+    
+    return HomeAssistantConfigResponse(**response_data)
 
 @router.put("/config", response_model=HomeAssistantConfigResponse)
-def update_ha_config(config_update: dict, db: Session = Depends(get_db)):
+def update_ha_config(config_update: HomeAssistantConfigUpdate, db: Session = Depends(get_db)):
     """Update Home Assistant configuration"""
     config = db.query(HomeAssistantConfig).first()
     
@@ -35,15 +46,23 @@ def update_ha_config(config_update: dict, db: Session = Depends(get_db)):
         config = HomeAssistantConfig()
         db.add(config)
     
-    # Update fields
-    for key, value in config_update.items():
-        if hasattr(config, key):
-            setattr(config, key, value)
+    # Update fields (dry_run -> dry_run_mode)
+    config.base_url = config_update.base_url
+    config.api_token = config_update.api_token
+    config.dry_run_mode = config_update.dry_run
     
     db.commit()
     db.refresh(config)
     
-    return HomeAssistantConfigResponse.model_validate(config)
+    # Convert to response format
+    response_data = {
+        "id": config.id,
+        "base_url": config.base_url,
+        "api_token": "***",  # Masked
+        "dry_run": config.dry_run_mode
+    }
+    
+    return HomeAssistantConfigResponse(**response_data)
 
 @router.get("/test")
 async def test_ha_connection(db: Session = Depends(get_db)):
