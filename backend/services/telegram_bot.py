@@ -280,26 +280,29 @@ Sen bir akıllı ev asistanısın. Kullanıcının mesajını anla ve aşağıda
 
 **Önemli:** Eğer kullanıcının mesajında Home Assistant cihaz kontrolü varsa:
 1. Yukarıdaki entity listesinden ilgili entity'leri bul (örn: "salon ışıkları" → light.salon, "mutfak" → light.mutfak)
-2. Entity ID'yi tam olarak kullan (örn: light.salon, switch.klima, climate.oda)
-3. Hangi işlem yapılacak belirle (on/off/set_temperature)
+2. Entity ID'yi tam olarak kullan (örn: light.salon, switch.klima, climate.oda, sensor.salon_sicaklik)
+3. Hangi işlem yapılacak belirle (on/off/set_temperature/get_state)
 4. Cevabın sonuna HA komutlarını JSON formatında ekle:
 
 Cevap formatı:
 [Normal LLM cevabı]
 
-HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_temperature", "temperature": 22}}
+HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_temperature/get_state", "temperature": 22}}
 
 **Kurallar:**
-- Entity ID'leri yukarıdaki listeden tam olarak kullan (örn: light.salon, light.mutfak)
+- Entity ID'leri yukarıdaki listeden tam olarak kullan (örn: light.salon, light.mutfak, sensor.salon_sicaklik)
 - "aç" veya "açık" → action: "on"
 - "kapat" veya "kapalı" → action: "off"
 - Sıcaklık ayarlama → action: "set_temperature", temperature değeri ekle
+- Sıcaklık/sensor değeri okuma → action: "get_state" (örn: "salon sıcaklığı kaç?", "oda nemi nedir?")
 - Eğer entity bulunamazsa, sadece cevap ver, HA_COMMAND ekleme
 
 **Örnekler:**
 - "Salon ışıklarını aç" → HA_COMMAND: {{"entities": ["light.salon"], "action": "on"}}
 - "Mutfak ışığını kapat" → HA_COMMAND: {{"entities": ["light.mutfak"], "action": "off"}}
 - "Odayı 22 dereceye ayarla" → HA_COMMAND: {{"entities": ["climate.oda"], "action": "set_temperature", "temperature": 22}}
+- "Salon sıcaklığı kaç derece?" → HA_COMMAND: {{"entities": ["sensor.salon_sicaklik"], "action": "get_state"}}
+- "Oda nemi nedir?" → HA_COMMAND: {{"entities": ["sensor.oda_nem"], "action": "get_state"}}
 - "Bugün hava nasıl?" → Sadece cevap ver, HA_COMMAND ekleme
             """
             
@@ -360,11 +363,35 @@ HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_te
                         logger.warning("HA command found but HA client not initialized")
                         bot_response += "\n\n⚠️ Home Assistant yapılandırılmamış. Lütfen admin panel'den yapılandırın."
                     elif self.ha_dry_run:
-                        # Dry run mode - just log, don't execute
+                        # Dry run mode - for get_state, we can still read (it's safe)
                         entities = ha_command.get("entities", [])
                         action = ha_command.get("action")
-                        logger.info(f"[DRY RUN] Would execute HA command: action={action}, entities={entities}")
-                        bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {action} → {', '.join(entities)}"
+                        
+                        if action == "get_state" or not action or action == "":
+                            # For read operations, we can execute even in dry run (safe)
+                            try:
+                                for entity_id in entities:
+                                    states = await self.ha_client.get_states(entity_id)
+                                    if states and len(states) > 0:
+                                        state = states[0]
+                                        state_value = state.get("state", "N/A")
+                                        attributes = state.get("attributes", {})
+                                        unit = attributes.get("unit_of_measurement", "")
+                                        friendly_name = attributes.get("friendly_name", entity_id)
+                                        
+                                        if unit:
+                                            value_str = f"{state_value} {unit}"
+                                        else:
+                                            value_str = str(state_value)
+                                        
+                                        bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
+                                        logger.info(f"[DRY RUN] Read state for {entity_id}: {value_str}")
+                            except Exception as e:
+                                logger.warning(f"[DRY RUN] Could not read state: {e}")
+                                bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {action} → {', '.join(entities)}"
+                        else:
+                            logger.info(f"[DRY RUN] Would execute HA command: action={action}, entities={entities}")
+                            bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {action} → {', '.join(entities)}"
                     else:
                         # Execute command
                         try:
@@ -391,6 +418,60 @@ HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_te
                                         result = await self.ha_client.set_temperature(entity_id, temp)
                                         logger.info(f"Successfully set temperature {temp} for {entity_id}: {result}")
                                         success_count += 1
+                                    elif action == "get_state":
+                                        # Read entity state and update bot response with actual value
+                                        states = await self.ha_client.get_states(entity_id)
+                                        if states and len(states) > 0:
+                                            state = states[0]
+                                            state_value = state.get("state", "N/A")
+                                            attributes = state.get("attributes", {})
+                                            unit = attributes.get("unit_of_measurement", "")
+                                            friendly_name = attributes.get("friendly_name", entity_id)
+                                            
+                                            # Format the value nicely
+                                            if unit:
+                                                value_str = f"{state_value} {unit}"
+                                            else:
+                                                value_str = str(state_value)
+                                            
+                                            # Update bot response with actual value
+                                            # Find if there's a placeholder or add the actual value
+                                            if "**" in bot_response or "derece" in bot_response.lower() or "°" in bot_response:
+                                                # Replace placeholder or add actual value
+                                                bot_response = bot_response.replace("**21.5**", f"**{state_value}**")
+                                                bot_response = bot_response.replace("21.5", state_value)
+                                                if unit and unit not in bot_response:
+                                                    bot_response = bot_response.replace(state_value, f"{state_value} {unit}")
+                                            else:
+                                                # Add value if not present
+                                                bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
+                                            
+                                            logger.info(f"Successfully read state for {entity_id}: {value_str}")
+                                            success_count += 1
+                                        else:
+                                            logger.warning(f"No state found for {entity_id}")
+                                            error_messages.append(f"{entity_id}: Değer okunamadı")
+                                    elif not action or action == "":
+                                        # Empty action - might be a read operation, try get_state
+                                        logger.info(f"Empty action for {entity_id}, trying get_state")
+                                        states = await self.ha_client.get_states(entity_id)
+                                        if states and len(states) > 0:
+                                            state = states[0]
+                                            state_value = state.get("state", "N/A")
+                                            attributes = state.get("attributes", {})
+                                            unit = attributes.get("unit_of_measurement", "")
+                                            friendly_name = attributes.get("friendly_name", entity_id)
+                                            
+                                            if unit:
+                                                value_str = f"{state_value} {unit}"
+                                            else:
+                                                value_str = str(state_value)
+                                            
+                                            bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
+                                            logger.info(f"Successfully read state for {entity_id}: {value_str}")
+                                            success_count += 1
+                                        else:
+                                            logger.warning(f"Empty action and no state found for {entity_id}")
                                     else:
                                         logger.warning(f"Unknown action: {action}")
                                         error_messages.append(f"Bilinmeyen işlem: {action}")
