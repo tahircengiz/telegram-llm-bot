@@ -52,6 +52,7 @@ async def get_bot_info(db: Session = Depends(get_db)):
     
     try:
         from telegram import Bot
+        from telegram.error import TelegramError
         
         bot = Bot(token=config.bot_token)
         bot_info = await bot.get_me()
@@ -63,11 +64,20 @@ async def get_bot_info(db: Session = Depends(get_db)):
                 "id": bot_info.id,
                 "username": bot_info.username,
                 "first_name": bot_info.first_name,
-                "is_bot": bot_info.is_bot
+                "is_bot": bot_info.is_bot,
+                "can_join_groups": bot_info.can_join_groups,
+                "can_read_all_group_messages": bot_info.can_read_all_group_messages
             }
         )
         
+    except TelegramError as e:
+        logger.error(f"Telegram API error: {e}", exc_info=True)
+        return TestResponse(
+            success=False,
+            message=f"Telegram API error: {str(e)}"
+        )
     except Exception as e:
+        logger.error(f"Unexpected error getting bot info: {e}", exc_info=True)
         return TestResponse(
             success=False,
             message=f"Failed to get bot info: {str(e)}"

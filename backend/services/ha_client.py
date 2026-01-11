@@ -1,6 +1,9 @@
 import httpx
+import logging
 from typing import List, Dict, Any, Optional
 from ..schemas import TestResponse
+
+logger = logging.getLogger(__name__)
 
 
 class HomeAssistantClient:
@@ -104,3 +107,33 @@ class HomeAssistantClient:
             entity_id,
             {"temperature": temperature}
         )
+    
+    async def get_entities(self, domain: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get all entities, optionally filtered by domain"""
+        try:
+            states = await self.get_states()
+            if domain:
+                return [s for s in states if s.get("entity_id", "").startswith(f"{domain}.")]
+            return states
+        except Exception as e:
+            logger.error(f"Error getting entities: {e}")
+            return []
+    
+    async def search_entities(self, query: str, domain: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search entities by name/alias (fuzzy search)"""
+        entities = await self.get_entities(domain)
+        query_lower = query.lower()
+        results = []
+        
+        for entity in entities:
+            entity_id = entity.get("entity_id", "")
+            attributes = entity.get("attributes", {})
+            friendly_name = attributes.get("friendly_name", "")
+            
+            # Check if query matches entity_id or friendly_name
+            if (query_lower in entity_id.lower() or 
+                query_lower in friendly_name.lower() or
+                any(query_lower in str(v).lower() for v in attributes.values() if isinstance(v, str))):
+                results.append(entity)
+        
+        return results

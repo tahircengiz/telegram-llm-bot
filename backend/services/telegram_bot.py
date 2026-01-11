@@ -9,6 +9,7 @@ from ..database import get_db, SessionLocal
 from ..models import TelegramConfig, ConversationLog, LLMProvider, HomeAssistantConfig
 from .llm_provider import LLMProviderFactory
 from .ha_client import HomeAssistantClient
+from .entity_cache import get_entity_cache
 from ..utils.rate_limiter import RateLimiter
 from ..utils.retry import retry_async
 
@@ -39,13 +40,14 @@ class TelegramBotService:
         self.application = None
         self.ha_client: Optional[HomeAssistantClient] = None
         self.rate_limiter = RateLimiter(max_requests=self.rate_limit, time_window=60)
+        self.entity_cache = get_entity_cache()
     
     def _parse_chat_ids(self, chat_ids_str: str) -> list:
         """Parse JSON chat IDs (supports regular IDs and group IDs)"""
         import json
         try:
             ids = json.loads(chat_ids_str)
-            # Convert all IDs to strings for consistency
+            # Convert all IDs to strings for consistency (including negative group IDs)
             return [str(i) for i in ids]
         except:
             return []
@@ -58,6 +60,79 @@ class TelegramBotService:
             logger.info(f"HA client initialized: {ha_config.base_url}")
         else:
             self.ha_client = None
+    
+    async def _refresh_entity_cache(self):
+        """Refresh entity cache from Home Assistant"""
+        if not self.ha_client:
+            return
+        
+        try:
+            entities = await self.ha_client.get_states()
+            self.entity_cache.set(entities)
+            logger.info(f"Refreshed entity cache: {len(entities)} entities")
+        except Exception as e:
+            logger.error(f"Failed to refresh entity cache: {e}")
+    
+    def _get_entity_list_for_prompt(self) -> str:
+        """Get formatted entity list for LLM prompt"""
+        # Try to get from cache first
+        entity_list = self.entity_cache.get_entity_list_for_prompt()
+        
+        if entity_list == "Entity list not available":
+            # Cache is empty, try to get from HA (async, but we'll trigger refresh)
+            logger.warning("Entity cache empty, will refresh on next message")
+            return "Entity list is being loaded..."
+        
+        return entity_list
+    
+    async def _find_entity(self, query: str) -> Optional[str]:
+        """Find entity ID by name/query (fuzzy matching)"""
+        if not self.ha_client:
+            return None
+        
+        try:
+            # Get cached entities
+            cached = self.entity_cache.get()
+            if not cached:
+                return None
+            
+            query_lower = query.lower().strip()
+            
+            # Exact match first
+            for entity in cached:
+                entity_id = entity.get("entity_id", "")
+                if entity_id.lower() == query_lower:
+                    return entity_id
+            
+            # Fuzzy match
+            best_match = None
+            best_score = 0
+            
+            for entity in cached:
+                entity_id = entity.get("entity_id", "")
+                attributes = entity.get("attributes", {})
+                friendly_name = attributes.get("friendly_name", "").lower()
+                
+                # Check if query matches entity_id or friendly_name
+                if query_lower in entity_id.lower() or query_lower in friendly_name:
+                    # Score based on match quality
+                    score = 0
+                    if query_lower in entity_id.lower():
+                        score += 2
+                    if query_lower in friendly_name:
+                        score += 3
+                    if entity_id.lower().startswith(query_lower):
+                        score += 1
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = entity_id
+            
+            return best_match if best_match else None
+            
+        except Exception as e:
+            logger.error(f"Error finding entity: {e}")
+            return None
     
     def _is_ha_command(self, message: str) -> bool:
         """Check if message is a Home Assistant command"""
@@ -119,16 +194,31 @@ class TelegramBotService:
         chat = update.effective_chat
         chat_id = str(chat.id)
         
-        logger.info(f"Received message from chat_id: {chat_id}")
+        logger.info(f"Received message from chat_id: {chat_id}, type: {chat.type}")
         
         # Check if chat_id is allowed
         if chat_id not in self.allowed_chat_ids:
             logger.warning(f"Unauthorized chat ID: {chat_id}")
-            try:
-                await chat.send_message("❌ Bu bot sizin için yetkilendirilmemiş.")
-            except Exception as e:
-                logger.error(f"Failed to send unauthorized message: {e}")
-            return
+            
+            # In group chats, only respond if bot is mentioned
+            if chat.type in ['group', 'supergroup']:
+                if update.message and update.message.text:
+                    bot_username = context.bot.username if context.bot else None
+                    if bot_username and f"@{bot_username}" in update.message.text:
+                        # Bot is mentioned, allow response
+                        logger.info(f"Bot mentioned in group chat {chat_id}")
+                    else:
+                        # Not mentioned, ignore
+                        return
+                else:
+                    return
+            else:
+                # Private chat - send unauthorized message
+                try:
+                    await chat.send_message("❌ Bu bot sizin için yetkilendirilmemiş.")
+                except Exception as e:
+                    logger.error(f"Failed to send unauthorized message: {e}")
+                return
         
         # Rate limiting check
         if not self.rate_limiter.is_allowed(chat_id):
@@ -148,6 +238,14 @@ class TelegramBotService:
             logger.info("No message text, skipping")
             return
         
+        # Remove bot mention if present (for group chats)
+        if chat.type in ['group', 'supergroup']:
+            bot_username = context.bot.username if context.bot else None
+            if bot_username:
+                # Remove @bot_username mentions
+                user_message = re.sub(rf'@{bot_username}\s*', '', user_message, flags=re.IGNORECASE)
+                user_message = user_message.strip()
+        
         logger.info(f"User message: {user_message}")
         
         # Get LLM provider
@@ -156,31 +254,49 @@ class TelegramBotService:
             # Initialize HA client
             self._init_ha_client(db)
             
+            # Refresh entity cache if needed
+            if self.ha_client and not self.entity_cache.is_valid():
+                await self._refresh_entity_cache()
+            
             provider = LLMProviderFactory.get_active_provider(db)
             
             if not provider:
                 await chat.send_message("❌ No LLM provider configured")
                 return
             
-            # Enhanced system prompt with HA integration
-            system_prompt = """
+            # Get entity list for prompt
+            entity_list = self._get_entity_list_for_prompt() if self.ha_client else "Home Assistant not configured"
+            
+            # Enhanced system prompt with HA integration and entity list
+            system_prompt = f"""
 Sen bir akıllı ev asistanısın. Kullanıcının mesajını anla ve aşağıdakilere göre cevap ver:
 
+**Mevcut Home Assistant Entity'leri:**
+{entity_list}
+
 **Önemli:** Eğer kullanıcının mesajında Home Assistant cihaz kontrolü varsa:
-1. İlgili entity'leri belirle (örn: light.salon, light.mutfak, switch.klima)
-2. Hangi işlem yapılacak belirle (on/off/set_temperature)
-3. Cevabın sonuna HA komutlarını JSON formatında ekle:
+1. Yukarıdaki entity listesinden ilgili entity'leri bul (örn: "salon ışıkları" → light.salon, "mutfak" → light.mutfak)
+2. Entity ID'yi tam olarak kullan (örn: light.salon, switch.klima, climate.oda)
+3. Hangi işlem yapılacak belirle (on/off/set_temperature)
+4. Cevabın sonuna HA komutlarını JSON formatında ekle:
 
 Cevap formatı:
 [Normal LLM cevabı]
 
-HA_COMMAND: {"entities": ["entity1", "entity2"], "action": "on/off", "temperature": 22}
+HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_temperature", "temperature": 22}}
 
-Örnekler:
-- "Salon ışıklarını aç" → HA_COMMAND: {"entities": ["light.salon"], "action": "on"}
-- "Mutfak ışığını kapat" → HA_COMMAND: {"entities": ["light.mutfak"], "action": "off"}
-- "Odayı 22 dereceye ayarla" → HA_COMMAND: {"entities": ["climate.oda"], "action": "set_temperature", "temperature": 22}
-- "Bilmediğim bir soru" → Sadece cevap ver, HA_COMMAND ekleme
+**Kurallar:**
+- Entity ID'leri yukarıdaki listeden tam olarak kullan (örn: light.salon, light.mutfak)
+- "aç" veya "açık" → action: "on"
+- "kapat" veya "kapalı" → action: "off"
+- Sıcaklık ayarlama → action: "set_temperature", temperature değeri ekle
+- Eğer entity bulunamazsa, sadece cevap ver, HA_COMMAND ekleme
+
+**Örnekler:**
+- "Salon ışıklarını aç" → HA_COMMAND: {{"entities": ["light.salon"], "action": "on"}}
+- "Mutfak ışığını kapat" → HA_COMMAND: {{"entities": ["light.mutfak"], "action": "off"}}
+- "Odayı 22 dereceye ayarla" → HA_COMMAND: {{"entities": ["climate.oda"], "action": "set_temperature", "temperature": 22}}
+- "Bugün hava nasıl?" → Sadece cevap ver, HA_COMMAND ekleme
             """
             
             # Generate response with HA integration (with retry)
@@ -204,15 +320,35 @@ HA_COMMAND: {"entities": ["entity1", "entity2"], "action": "on/off", "temperatur
                 ha_command = None
                 if "HA_COMMAND:" in bot_response:
                     # Extract HA command
-                    match = re.search(r'HA_COMMAND:\s*(\{.*?\})', bot_response)
+                    match = re.search(r'HA_COMMAND:\s*(\{.*?\})', bot_response, re.DOTALL)
                     if match:
                         try:
                             import json
                             ha_command = json.loads(match.group(1))
                             # Remove HA_COMMAND from response
                             bot_response = bot_response.split("HA_COMMAND:")[0].strip()
-                        except json.JSONDecodeError:
-                            logger.warning("Failed to parse HA command")
+                            
+                            # Validate and fix entity IDs
+                            if ha_command and "entities" in ha_command:
+                                validated_entities = []
+                                for entity_id in ha_command["entities"]:
+                                    # Try to find matching entity if not exact match
+                                    if self.ha_client:
+                                        matched = await self._find_entity(entity_id)
+                                        if matched:
+                                            validated_entities.append(matched)
+                                        else:
+                                            # Use original if not found
+                                            validated_entities.append(entity_id)
+                                    else:
+                                        validated_entities.append(entity_id)
+                                
+                                ha_command["entities"] = validated_entities
+                                logger.info(f"Validated entities: {validated_entities}")
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Failed to parse HA command: {e}")
+                        except Exception as e:
+                            logger.error(f"Error validating entities: {e}")
                 
                 # Execute HA command if present
                 if ha_command and self.ha_client:
@@ -269,7 +405,30 @@ HA_COMMAND: {"entities": ["entity1", "entity2"], "action": "on/off", "temperatur
             db.close()
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
+        """Handle /start command (works in both private and group chats)"""
+        if not update.effective_chat:
+            return
+        
+        chat = update.effective_chat
+        chat_id = str(chat.id)
+        
+        # Check if chat is allowed (for group chats)
+        if chat_id not in self.allowed_chat_ids:
+            logger.warning(f"Unauthorized chat ID for /start: {chat_id}")
+            if chat.type in ['group', 'supergroup']:
+                # In groups, only respond if bot is mentioned
+                if update.message and update.message.text:
+                    bot_username = context.bot.username if context.bot else None
+                    if bot_username and f"@{bot_username}" not in update.message.text:
+                        return  # Don't respond if not mentioned
+            else:
+                # Private chat - send unauthorized message
+                try:
+                    await chat.send_message("❌ Bu bot sizin için yetkilendirilmemiş.")
+                except Exception as e:
+                    logger.error(f"Failed to send unauthorized message: {e}")
+                return
+        
         help_text = """
 👋 Merhaba! Ben akıllı ev asistanınızım.
 
@@ -294,7 +453,11 @@ HA_COMMAND: {"entities": ["entity1", "entity2"], "action": "on/off", "temperatur
 • LLM Provider: Ollama/OpenAI/Gemini seçebilirsiniz
 • Chat ID'leri: Admin panel'den yönetebilirsiniz
         """
-        await update.message.reply_text(help_text)
+        
+        try:
+            await update.message.reply_text(help_text)
+        except Exception as e:
+            logger.error(f"Failed to send /start response: {e}")
     
     def setup(self):
         """Setup bot application"""
