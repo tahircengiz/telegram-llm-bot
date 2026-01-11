@@ -2,7 +2,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from sqlalchemy.orm import Session
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import re
 
 from ..database import get_db, SessionLocal
@@ -42,6 +42,22 @@ class TelegramBotService:
         self.ha_dry_run: bool = False
         self.rate_limiter = RateLimiter(max_requests=self.rate_limit, time_window=60)
         self.entity_cache = get_entity_cache()
+        
+        # Action to service mapping for generic service calls
+        # Maps user-friendly actions to HA service names
+        self.action_to_service = {
+            "on": "turn_on",
+            "off": "turn_off",
+            "set_temperature": "set_temperature",
+            "set_brightness": "turn_on",  # brightness is a parameter
+            "set_color": "turn_on",  # color is a parameter
+            "toggle": "toggle",
+            "open": "open_cover",
+            "close": "close_cover",
+            "stop": "stop_cover",
+            "lock": "lock",
+            "unlock": "unlock",
+        }
     
     def _parse_chat_ids(self, chat_ids_str: str) -> list:
         """Parse JSON chat IDs (supports regular IDs and group IDs)"""
@@ -137,6 +153,110 @@ class TelegramBotService:
         except Exception as e:
             logger.error(f"Error finding entity: {e}")
             return None
+    
+    async def _execute_ha_command_generic(self, ha_command: Dict[str, Any], bot_response: str, dry_run: bool = False) -> Tuple[str, int, list]:
+        """
+        Generic HA command executor - LLM decides the service, we just call it.
+        Returns: (updated_bot_response, success_count, error_messages)
+        """
+        command_type = ha_command.get("type", "service")  # "service" or "get_state"
+        entity_id = ha_command.get("entity_id")
+        success_count = 0
+        error_messages = []
+        
+        # Backward compatibility: support old format
+        if "entities" in ha_command and not entity_id:
+            entities = ha_command.get("entities", [])
+            action = ha_command.get("action")
+            if entities and action:
+                # Convert old format to new format
+                entity_id = entities[0]  # Take first entity
+                if action == "get_state" or not action or action == "":
+                    command_type = "get_state"
+                else:
+                    # Try to infer domain and service from action
+                    domain = entity_id.split(".")[0] if "." in entity_id else "light"
+                    service = self.action_to_service.get(action, action)
+                    ha_command = {
+                        "type": "service",
+                        "domain": domain,
+                        "service": service,
+                        "entity_id": entity_id,
+                        "data": ha_command.get("data", {})
+                    }
+                    if "temperature" in ha_command:
+                        ha_command["data"]["temperature"] = ha_command["temperature"]
+                    command_type = "service"
+        
+        if not entity_id:
+            error_messages.append("Entity ID bulunamadı")
+            return bot_response, success_count, error_messages
+        
+        try:
+            if command_type == "get_state":
+                # Read entity state
+                states = await self.ha_client.get_states(entity_id)
+                if states and len(states) > 0:
+                    state = states[0]
+                    state_value = state.get("state", "N/A")
+                    attributes = state.get("attributes", {})
+                    unit = attributes.get("unit_of_measurement", "")
+                    friendly_name = attributes.get("friendly_name", entity_id)
+                    
+                    if unit:
+                        value_str = f"{state_value} {unit}"
+                    else:
+                        value_str = str(state_value)
+                    
+                    # Update bot response with actual value
+                    if "**" in bot_response or "derece" in bot_response.lower() or "°" in bot_response:
+                        # Replace placeholder
+                        bot_response = re.sub(r'\*\*[\d.]+\*\*', f"**{state_value}**", bot_response)
+                        bot_response = re.sub(r'[\d.]+(?=\s*(derece|°|%))', state_value, bot_response)
+                        if unit and unit not in bot_response:
+                            bot_response = bot_response.replace(state_value, f"{state_value} {unit}")
+                    else:
+                        # Add value if not present
+                        bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
+                    
+                    logger.info(f"{'[DRY RUN] ' if dry_run else ''}Read state for {entity_id}: {value_str}")
+                    success_count += 1
+                else:
+                    error_messages.append(f"{entity_id}: Değer okunamadı")
+                    
+            elif command_type == "service":
+                # Generic service call
+                domain = ha_command.get("domain")
+                service = ha_command.get("service")
+                data = ha_command.get("data", {})
+                
+                if not domain or not service:
+                    error_messages.append(f"Domain veya service belirtilmemiş: domain={domain}, service={service}")
+                else:
+                    if dry_run:
+                        logger.info(f"[DRY RUN] Would call service: {domain}.{service} on {entity_id} with data: {data}")
+                        bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {domain}.{service} → {entity_id}"
+                    else:
+                        result = await self.ha_client.call_service(domain, service, entity_id, data)
+                        logger.info(f"Successfully called {domain}.{service} on {entity_id}: {result}")
+                        success_count += 1
+            else:
+                error_messages.append(f"Bilinmeyen komut tipi: {command_type}")
+                
+        except Exception as e:
+            logger.error(f"Error executing HA command: {e}", exc_info=True)
+            error_messages.append(f"{entity_id}: {str(e)}")
+        
+        # Add result message
+        if not dry_run:
+            if success_count > 0 and not error_messages:
+                bot_response += f"\n\n✅ {success_count} komut başarıyla çalıştırıldı."
+            elif success_count > 0:
+                bot_response += f"\n\n⚠️ {success_count} komut çalıştırıldı, bazı hatalar: {', '.join(error_messages)}"
+            elif error_messages:
+                bot_response += f"\n\n❌ Komut çalıştırılamadı: {', '.join(error_messages)}"
+        
+        return bot_response, success_count, error_messages
     
     def _is_ha_command(self, message: str) -> bool:
         """Check if message is a Home Assistant command"""
@@ -273,37 +393,45 @@ class TelegramBotService:
             
             # Enhanced system prompt with HA integration and entity list
             system_prompt = f"""
-Sen bir akıllı ev asistanısın. Kullanıcının mesajını anla ve aşağıdakilere göre cevap ver:
+Sen bir akıllı ev asistanısın. Kullanıcının mesajını anla ve Home Assistant komutlarını doğru formatta üret.
 
 **Mevcut Home Assistant Entity'leri:**
 {entity_list}
 
-**Önemli:** Eğer kullanıcının mesajında Home Assistant cihaz kontrolü varsa:
-1. Yukarıdaki entity listesinden ilgili entity'leri bul (örn: "salon ışıkları" → light.salon, "mutfak" → light.mutfak)
-2. Entity ID'yi tam olarak kullan (örn: light.salon, switch.klima, climate.oda, sensor.salon_sicaklik)
-3. Hangi işlem yapılacak belirle (on/off/set_temperature/get_state)
-4. Cevabın sonuna HA komutlarını JSON formatında ekle:
+**Home Assistant Service Formatı:**
+Home Assistant'ta her işlem bir "service" çağrısıdır. Format: domain.service (örn: light.turn_on, climate.set_temperature)
 
-Cevap formatı:
+**Önemli Kurallar:**
+1. Entity ID'leri yukarıdaki listeden tam olarak kullan (örn: light.salon, switch.klima, climate.oda, sensor.salon_sicaklik)
+2. Her entity'nin domain'ini belirle (light, switch, climate, sensor, cover, lock, vb.)
+3. Doğru service adını kullan:
+   - Işık açma → light.turn_on
+   - Işık kapatma → light.turn_off
+   - Sıcaklık ayarlama → climate.set_temperature
+   - Kapı açma → cover.open_cover
+   - Kapı kapatma → cover.close_cover
+   - Kilit açma → lock.unlock
+   - Kilit kapatma → lock.lock
+   - Sensor okuma → type: "get_state" (service değil, direkt state okuma)
+
+**Cevap Formatı:**
 [Normal LLM cevabı]
 
-HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_temperature/get_state", "temperature": 22}}
+HA_COMMAND: {{"type": "service", "domain": "light", "service": "turn_on", "entity_id": "light.salon", "data": {{}}}}
 
-**Kurallar:**
-- Entity ID'leri yukarıdaki listeden tam olarak kullan (örn: light.salon, light.mutfak, sensor.salon_sicaklik)
-- "aç" veya "açık" → action: "on"
-- "kapat" veya "kapalı" → action: "off"
-- Sıcaklık ayarlama → action: "set_temperature", temperature değeri ekle
-- Sıcaklık/sensor değeri okuma → action: "get_state" (örn: "salon sıcaklığı kaç?", "oda nemi nedir?")
-- Eğer entity bulunamazsa, sadece cevap ver, HA_COMMAND ekleme
+VEYA okuma için:
+HA_COMMAND: {{"type": "get_state", "entity_id": "sensor.salon_sicaklik"}}
 
 **Örnekler:**
-- "Salon ışıklarını aç" → HA_COMMAND: {{"entities": ["light.salon"], "action": "on"}}
-- "Mutfak ışığını kapat" → HA_COMMAND: {{"entities": ["light.mutfak"], "action": "off"}}
-- "Odayı 22 dereceye ayarla" → HA_COMMAND: {{"entities": ["climate.oda"], "action": "set_temperature", "temperature": 22}}
-- "Salon sıcaklığı kaç derece?" → HA_COMMAND: {{"entities": ["sensor.salon_sicaklik"], "action": "get_state"}}
-- "Oda nemi nedir?" → HA_COMMAND: {{"entities": ["sensor.oda_nem"], "action": "get_state"}}
+- "Salon ışıklarını aç" → HA_COMMAND: {{"type": "service", "domain": "light", "service": "turn_on", "entity_id": "light.salon", "data": {{}}}}
+- "Mutfak ışığını kapat" → HA_COMMAND: {{"type": "service", "domain": "light", "service": "turn_off", "entity_id": "light.mutfak", "data": {{}}}}
+- "Odayı 22 dereceye ayarla" → HA_COMMAND: {{"type": "service", "domain": "climate", "service": "set_temperature", "entity_id": "climate.oda", "data": {{"temperature": 22}}}}
+- "Salon sıcaklığı kaç derece?" → HA_COMMAND: {{"type": "get_state", "entity_id": "sensor.salon_sicaklik"}}
+- "Oda nemi nedir?" → HA_COMMAND: {{"type": "get_state", "entity_id": "sensor.oda_nem"}}
+- "Işığın parlaklığını 50 yap" → HA_COMMAND: {{"type": "service", "domain": "light", "service": "turn_on", "entity_id": "light.salon", "data": {{"brightness": 128}}}}
 - "Bugün hava nasıl?" → Sadece cevap ver, HA_COMMAND ekleme
+
+**Not:** Eğer entity bulunamazsa veya işlem Home Assistant ile ilgili değilse, sadece cevap ver, HA_COMMAND ekleme.
             """
             
             # Generate response with HA integration (with retry)
@@ -335,27 +463,20 @@ HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_te
                             # Remove HA_COMMAND from response
                             bot_response = bot_response.split("HA_COMMAND:")[0].strip()
                             
-                            # Validate and fix entity IDs
-                            if ha_command and "entities" in ha_command:
-                                validated_entities = []
-                                for entity_id in ha_command["entities"]:
-                                    # Try to find matching entity if not exact match
-                                    if self.ha_client:
-                                        matched = await self._find_entity(entity_id)
-                                        if matched:
-                                            validated_entities.append(matched)
-                                        else:
-                                            # Use original if not found
-                                            validated_entities.append(entity_id)
+                            # Validate and fix entity ID if present
+                            if ha_command and "entity_id" in ha_command:
+                                entity_id = ha_command["entity_id"]
+                                if self.ha_client:
+                                    matched = await self._find_entity(entity_id)
+                                    if matched:
+                                        ha_command["entity_id"] = matched
+                                        logger.info(f"Validated entity: {entity_id} → {matched}")
                                     else:
-                                        validated_entities.append(entity_id)
-                                
-                                ha_command["entities"] = validated_entities
-                                logger.info(f"Validated entities: {validated_entities}")
+                                        logger.warning(f"Entity not found: {entity_id}, using as-is")
                         except json.JSONDecodeError as e:
                             logger.warning(f"Failed to parse HA command: {e}")
                         except Exception as e:
-                            logger.error(f"Error validating entities: {e}")
+                            logger.error(f"Error validating entity: {e}")
                 
                 # Execute HA command if present
                 if ha_command:
@@ -363,133 +484,23 @@ HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_te
                         logger.warning("HA command found but HA client not initialized")
                         bot_response += "\n\n⚠️ Home Assistant yapılandırılmamış. Lütfen admin panel'den yapılandırın."
                     elif self.ha_dry_run:
-                        # Dry run mode - for get_state, we can still read (it's safe)
-                        entities = ha_command.get("entities", [])
-                        action = ha_command.get("action")
-                        
-                        if action == "get_state" or not action or action == "":
-                            # For read operations, we can execute even in dry run (safe)
-                            try:
-                                for entity_id in entities:
-                                    states = await self.ha_client.get_states(entity_id)
-                                    if states and len(states) > 0:
-                                        state = states[0]
-                                        state_value = state.get("state", "N/A")
-                                        attributes = state.get("attributes", {})
-                                        unit = attributes.get("unit_of_measurement", "")
-                                        friendly_name = attributes.get("friendly_name", entity_id)
-                                        
-                                        if unit:
-                                            value_str = f"{state_value} {unit}"
-                                        else:
-                                            value_str = str(state_value)
-                                        
-                                        bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
-                                        logger.info(f"[DRY RUN] Read state for {entity_id}: {value_str}")
-                            except Exception as e:
-                                logger.warning(f"[DRY RUN] Could not read state: {e}")
-                                bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {action} → {', '.join(entities)}"
-                        else:
-                            logger.info(f"[DRY RUN] Would execute HA command: action={action}, entities={entities}")
-                            bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {action} → {', '.join(entities)}"
+                        # Dry run mode
+                        bot_response, success_count, error_messages = await self._execute_ha_command_generic(ha_command, bot_response, dry_run=True)
                     else:
                         # Execute command
-                        try:
-                            entities = ha_command.get("entities", [])
-                            action = ha_command.get("action")
-                            
-                            logger.info(f"Executing HA command: {action} on entities: {entities}")
-                            
-                            success_count = 0
-                            error_messages = []
-                            
-                            for entity_id in entities:
-                                try:
-                                    if action == "on":
-                                        result = await self.ha_client.turn_on(entity_id)
-                                        logger.info(f"Successfully turned on {entity_id}: {result}")
-                                        success_count += 1
-                                    elif action == "off":
-                                        result = await self.ha_client.turn_off(entity_id)
-                                        logger.info(f"Successfully turned off {entity_id}: {result}")
-                                        success_count += 1
-                                    elif action == "set_temperature" and "temperature" in ha_command:
-                                        temp = ha_command["temperature"]
-                                        result = await self.ha_client.set_temperature(entity_id, temp)
-                                        logger.info(f"Successfully set temperature {temp} for {entity_id}: {result}")
-                                        success_count += 1
-                                    elif action == "get_state":
-                                        # Read entity state and update bot response with actual value
-                                        states = await self.ha_client.get_states(entity_id)
-                                        if states and len(states) > 0:
-                                            state = states[0]
-                                            state_value = state.get("state", "N/A")
-                                            attributes = state.get("attributes", {})
-                                            unit = attributes.get("unit_of_measurement", "")
-                                            friendly_name = attributes.get("friendly_name", entity_id)
-                                            
-                                            # Format the value nicely
-                                            if unit:
-                                                value_str = f"{state_value} {unit}"
-                                            else:
-                                                value_str = str(state_value)
-                                            
-                                            # Update bot response with actual value
-                                            # Find if there's a placeholder or add the actual value
-                                            if "**" in bot_response or "derece" in bot_response.lower() or "°" in bot_response:
-                                                # Replace placeholder or add actual value
-                                                bot_response = bot_response.replace("**21.5**", f"**{state_value}**")
-                                                bot_response = bot_response.replace("21.5", state_value)
-                                                if unit and unit not in bot_response:
-                                                    bot_response = bot_response.replace(state_value, f"{state_value} {unit}")
-                                            else:
-                                                # Add value if not present
-                                                bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
-                                            
-                                            logger.info(f"Successfully read state for {entity_id}: {value_str}")
-                                            success_count += 1
-                                        else:
-                                            logger.warning(f"No state found for {entity_id}")
-                                            error_messages.append(f"{entity_id}: Değer okunamadı")
-                                    elif not action or action == "":
-                                        # Empty action - might be a read operation, try get_state
-                                        logger.info(f"Empty action for {entity_id}, trying get_state")
-                                        states = await self.ha_client.get_states(entity_id)
-                                        if states and len(states) > 0:
-                                            state = states[0]
-                                            state_value = state.get("state", "N/A")
-                                            attributes = state.get("attributes", {})
-                                            unit = attributes.get("unit_of_measurement", "")
-                                            friendly_name = attributes.get("friendly_name", entity_id)
-                                            
-                                            if unit:
-                                                value_str = f"{state_value} {unit}"
-                                            else:
-                                                value_str = str(state_value)
-                                            
-                                            bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
-                                            logger.info(f"Successfully read state for {entity_id}: {value_str}")
-                                            success_count += 1
-                                        else:
-                                            logger.warning(f"Empty action and no state found for {entity_id}")
-                                    else:
-                                        logger.warning(f"Unknown action: {action}")
-                                        error_messages.append(f"Bilinmeyen işlem: {action}")
-                                except Exception as e:
-                                    logger.error(f"Error executing HA command for {entity_id}: {e}", exc_info=True)
-                                    error_messages.append(f"{entity_id}: {str(e)}")
-                            
-                            # Add result message
-                            if success_count > 0 and not error_messages:
-                                bot_response += f"\n\n✅ {success_count} komut başarıyla çalıştırıldı."
-                            elif success_count > 0:
-                                bot_response += f"\n\n⚠️ {success_count} komut çalıştırıldı, bazı hatalar: {', '.join(error_messages)}"
-                            else:
-                                bot_response += f"\n\n❌ Komut çalıştırılamadı: {', '.join(error_messages)}"
-                                
-                        except Exception as e:
-                            logger.error(f"HA command execution error: {e}", exc_info=True)
-                            bot_response += f"\n\n⚠️ Akıllı ev komutu başarısız: {str(e)}"
+                        bot_response, success_count, error_messages = await self._execute_ha_command_generic(ha_command, bot_response, dry_run=False)
+                        
+                        # Add result message
+                        if success_count > 0 and not error_messages:
+                            bot_response += f"\n\n✅ {success_count} komut başarıyla çalıştırıldı."
+                        elif success_count > 0:
+                            bot_response += f"\n\n⚠️ {success_count} komut çalıştırıldı, bazı hatalar: {', '.join(error_messages)}"
+                        elif error_messages:
+                            bot_response += f"\n\n❌ Komut çalıştırılamadı: {', '.join(error_messages)}"
+                        
+                        if error_messages and success_count == 0:
+                            logger.error(f"HA command execution failed: {', '.join(error_messages)}")
+                            bot_response += f"\n\n⚠️ Akıllı ev komutu başarısız: {', '.join(error_messages)}"
                 
                 # Send response (with retry)
                 async def send_with_retry():
