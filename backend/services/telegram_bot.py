@@ -255,7 +255,7 @@ class TelegramBotService:
         # Get LLM provider
         db = SessionLocal()
         try:
-            # Initialize HA client
+            # Initialize HA client (always refresh to get latest config)
             self._init_ha_client(db)
             
             # Refresh entity cache if needed
