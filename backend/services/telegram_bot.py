@@ -363,7 +363,7 @@ HA_COMMAND: {{"entities": ["entity_id1", "entity_id2"], "action": "on/off/set_te
                         # Dry run mode - just log, don't execute
                         entities = ha_command.get("entities", [])
                         action = ha_command.get("action")
-                        logger.info(f"[DRY RUN] Would execute HA command: {action} on {entities}")
+                        logger.info(f"[DRY RUN] Would execute HA command: action={action}, entities={entities}")
                         bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {action} → {', '.join(entities)}"
                     else:
                         # Execute command
