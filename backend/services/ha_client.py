@@ -137,3 +137,56 @@ class HomeAssistantClient:
                 results.append(entity)
         
         return results
+    
+    async def get_services(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Get all available services from Home Assistant"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.base_url}/api/services",
+                    headers=self.headers,
+                    timeout=10.0
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    logger.warning(f"Failed to get services: {response.status_code}")
+                    return {}
+        except Exception as e:
+            logger.error(f"Error getting services: {e}")
+            return {}
+    
+    async def get_entity_info(self, entity_id: str) -> Optional[Dict[str, Any]]:
+        """Get detailed entity information including state and capabilities"""
+        try:
+            states = await self.get_states(entity_id)
+            if not states or len(states) == 0:
+                return None
+            
+            state = states[0]
+            attributes = state.get("attributes", {})
+            domain = entity_id.split(".")[0]
+            
+            return {
+                "entity_id": entity_id,
+                "domain": domain,
+                "state": state.get("state", "unknown"),
+                "attributes": attributes,
+                "friendly_name": attributes.get("friendly_name", entity_id),
+                "supported_features": attributes.get("supported_features", 0),
+                "device_class": attributes.get("device_class"),
+                "unit_of_measurement": attributes.get("unit_of_measurement"),
+            }
+        except Exception as e:
+            logger.error(f"Error getting entity info for {entity_id}: {e}")
+            return None
+    
+    async def get_entity_state(self, entity_id: str) -> Optional[str]:
+        """Get current state of an entity"""
+        try:
+            info = await self.get_entity_info(entity_id)
+            return info.get("state") if info else None
+        except Exception as e:
+            logger.error(f"Error getting entity state for {entity_id}: {e}")
+            return None

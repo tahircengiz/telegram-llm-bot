@@ -12,6 +12,7 @@ from .ha_client import HomeAssistantClient
 from .entity_cache import get_entity_cache
 from ..utils.rate_limiter import RateLimiter
 from ..utils.retry import retry_async
+from ..utils.question_detector import QuestionDetector
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,41 @@ class TelegramBotService:
             return "Entity list is being loaded..."
         
         return entity_list
+    
+    async def _get_enhanced_entity_list(self) -> str:
+        """Get entity list with state information for enhanced prompt"""
+        if not self.ha_client:
+            return "Home Assistant not configured"
+        
+        try:
+            cached = self.entity_cache.get()
+            if not cached:
+                return "Entity list is being loaded..."
+            
+            # Limit to first 100 entities to avoid prompt size issues
+            entities = cached[:100]
+            formatted = []
+            
+            for entity in entities:
+                entity_id = entity.get("entity_id", "")
+                attributes = entity.get("attributes", {})
+                state = entity.get("state", "unknown")
+                friendly_name = attributes.get("friendly_name", entity_id)
+                domain = entity_id.split(".")[0] if "." in entity_id else "unknown"
+                
+                # Add unit if available
+                unit = attributes.get("unit_of_measurement", "")
+                state_display = f"{state} {unit}".strip() if unit else state
+                
+                formatted.append(f"- {entity_id} ({friendly_name}): {state_display} [{domain}]")
+            
+            if len(cached) > 100:
+                formatted.append(f"\n... ve {len(cached) - 100} entity daha")
+            
+            return "\n".join(formatted) if formatted else "No entities found"
+        except Exception as e:
+            logger.error(f"Error formatting entity list: {e}")
+            return "Error loading entity list"
     
     async def _find_entity(self, query: str) -> Optional[str]:
         """Find entity ID by name/query (fuzzy matching)"""
@@ -237,9 +273,53 @@ class TelegramBotService:
                         logger.info(f"[DRY RUN] Would call service: {domain}.{service} on {entity_id} with data: {data}")
                         bot_response += f"\n\n🔍 [DRY RUN] Komut çalıştırılacaktı: {domain}.{service} → {entity_id}"
                     else:
-                        result = await self.ha_client.call_service(domain, service, entity_id, data)
-                        logger.info(f"Successfully called {domain}.{service} on {entity_id}: {result}")
-                        success_count += 1
+                        try:
+                            result = await self.ha_client.call_service(domain, service, entity_id, data)
+                            logger.info(f"Successfully called {domain}.{service} on {entity_id}: {result}")
+                            success_count += 1
+                        except Exception as e:
+                            error_str = str(e)
+                            logger.error(f"Service call failed: {error_str}")
+                            
+                            # Try to fix common errors
+                            if "400" in error_str:
+                                # Bad request - try to get entity info and suggest fix
+                                try:
+                                    entity_info = await self.ha_client.get_entity_info(entity_id)
+                                    if entity_info:
+                                        actual_domain = entity_info.get("domain")
+                                        if actual_domain and actual_domain != domain:
+                                            # Domain mismatch - try with correct domain
+                                            logger.info(f"Domain mismatch detected: {domain} → {actual_domain}, retrying...")
+                                            try:
+                                                result = await self.ha_client.call_service(actual_domain, service, entity_id, data)
+                                                logger.info(f"Successfully called {actual_domain}.{service} on {entity_id} after domain correction: {result}")
+                                                success_count += 1
+                                            except Exception as retry_e:
+                                                error_messages.append(f"Domain düzeltmesi sonrası hata: {str(retry_e)}")
+                                        else:
+                                            # Check if it's a group entity - might need group service
+                                            if actual_domain == "group":
+                                                # Group entities might need group.turn_on instead of light.turn_on
+                                                if service in ["turn_on", "turn_off"]:
+                                                    logger.info(f"Group entity detected, using group.{service}")
+                                                    try:
+                                                        result = await self.ha_client.call_service("group", service, entity_id, data)
+                                                        logger.info(f"Successfully called group.{service} on {entity_id}: {result}")
+                                                        success_count += 1
+                                                    except Exception as group_e:
+                                                        error_messages.append(f"Group service hatası: {str(group_e)}")
+                                                else:
+                                                    error_messages.append(f"Service hatası (400): {error_str}. Entity: {entity_id}, Domain: {actual_domain}")
+                                            else:
+                                                error_messages.append(f"Service hatası (400): {error_str}. Entity: {entity_id}, Domain: {actual_domain}")
+                                    else:
+                                        error_messages.append(f"Service hatası: {error_str}")
+                                except Exception as info_e:
+                                    logger.error(f"Error getting entity info for error correction: {info_e}")
+                                    error_messages.append(f"Service hatası: {error_str}")
+                            else:
+                                error_messages.append(f"Service hatası: {error_str}")
             else:
                 error_messages.append(f"Bilinmeyen komut tipi: {command_type}")
                 
@@ -388,51 +468,74 @@ class TelegramBotService:
                 await chat.send_message("❌ No LLM provider configured")
                 return
             
-            # Get entity list for prompt
-            entity_list = self._get_entity_list_for_prompt() if self.ha_client else "Home Assistant not configured"
+            # Check if message is a question requiring state read
+            is_state_query = QuestionDetector.requires_state_read(user_message)
             
-            # Enhanced system prompt with HA integration and entity list
+            # Get entity list with state information
+            entity_list = await self._get_enhanced_entity_list() if self.ha_client else "Home Assistant not configured"
+            
+            # Get available services
+            services_info = ""
+            if self.ha_client:
+                try:
+                    services = await self.ha_client.get_services()
+                    if services:
+                        # Format services for prompt (limit to common domains)
+                        common_domains = ["light", "switch", "climate", "cover", "lock", "group", "fan", "media_player"]
+                        services_list = []
+                        for domain in common_domains:
+                            if domain in services:
+                                domain_services = [s.get("service", "") for s in services[domain] if isinstance(s, dict)]
+                                if domain_services:
+                                    services_list.append(f"{domain}: {', '.join(domain_services[:10])}")  # Limit to 10 services per domain
+                        if services_list:
+                            services_info = "\n".join(services_list)
+                except Exception as e:
+                    logger.warning(f"Failed to get services: {e}")
+            
+            # Enhanced system prompt with HA integration
             system_prompt = f"""
 Sen bir akıllı ev asistanısın. Kullanıcının mesajını anla ve Home Assistant komutlarını doğru formatta üret.
 
-**Mevcut Home Assistant Entity'leri:**
+**Mevcut Home Assistant Entity'leri ve Durumları:**
 {entity_list}
 
-**Home Assistant Service Formatı:**
-Home Assistant'ta her işlem bir "service" çağrısıdır. Format: domain.service (örn: light.turn_on, climate.set_temperature)
+**Mevcut Service'ler:**
+{services_info if services_info else "Service listesi yükleniyor..."}
 
-**Önemli Kurallar:**
-1. Entity ID'leri yukarıdaki listeden tam olarak kullan (örn: light.salon, switch.klima, climate.oda, sensor.salon_sicaklik)
-2. Her entity'nin domain'ini belirle (light, switch, climate, sensor, cover, lock, vb.)
-3. Doğru service adını kullan:
-   - Işık açma → light.turn_on
-   - Işık kapatma → light.turn_off
-   - Sıcaklık ayarlama → climate.set_temperature
-   - Kapı açma → cover.open_cover
-   - Kapı kapatma → cover.close_cover
-   - Kilit açma → lock.unlock
-   - Kilit kapatma → lock.lock
-   - Sensor okuma → type: "get_state" (service değil, direkt state okuma)
+**ÖNEMLİ KURALLAR:**
 
-**Cevap Formatı:**
-[Normal LLM cevabı]
+1. **Soru Tespiti:**
+   - Kullanıcı soru soruyorsa (?, kaç, nedir, açık mı, kapalı mı) → MUTLAKA type: "get_state" kullan
+   - "Açık mı?", "Kaç derece?", "Nedir?" gibi sorular için service çağrısı YAPMA, sadece state oku
 
-HA_COMMAND: {{"type": "service", "domain": "light", "service": "turn_on", "entity_id": "light.salon", "data": {{}}}}
+2. **Entity Seçimi:**
+   - Entity ID'leri yukarıdaki listeden tam olarak kullan
+   - Entity'nin mevcut state'ini kontrol et (yukarıdaki listede var)
+   - Group entity'ler için group domain service'lerini kullan (örn: group.turn_on, group.turn_off)
 
-VEYA okuma için:
-HA_COMMAND: {{"type": "get_state", "entity_id": "sensor.salon_sicaklik"}}
+3. **Service Seçimi:**
+   - Her entity'nin domain'ini belirle (light, switch, climate, sensor, cover, lock, group, vb.)
+   - Yukarıdaki service listesinden doğru service'i seç
+   - Group entity'ler için group domain service'lerini kullan
+
+4. **Format:**
+   - İşlem yapılacaksa: {{"type": "service", "domain": "light", "service": "turn_on", "entity_id": "light.salon", "data": {{}}}}
+   - State okunacaksa: {{"type": "get_state", "entity_id": "sensor.salon_sicaklik"}}
 
 **Örnekler:**
 - "Salon ışıklarını aç" → HA_COMMAND: {{"type": "service", "domain": "light", "service": "turn_on", "entity_id": "light.salon", "data": {{}}}}
-- "Mutfak ışığını kapat" → HA_COMMAND: {{"type": "service", "domain": "light", "service": "turn_off", "entity_id": "light.mutfak", "data": {{}}}}
-- "Odayı 22 dereceye ayarla" → HA_COMMAND: {{"type": "service", "domain": "climate", "service": "set_temperature", "entity_id": "climate.oda", "data": {{"temperature": 22}}}}
 - "Salon sıcaklığı kaç derece?" → HA_COMMAND: {{"type": "get_state", "entity_id": "sensor.salon_sicaklik"}}
-- "Oda nemi nedir?" → HA_COMMAND: {{"type": "get_state", "entity_id": "sensor.oda_nem"}}
-- "Işığın parlaklığını 50 yap" → HA_COMMAND: {{"type": "service", "domain": "light", "service": "turn_on", "entity_id": "light.salon", "data": {{"brightness": 128}}}}
-- "Bugün hava nasıl?" → Sadece cevap ver, HA_COMMAND ekleme
+- "Petekler açık mı?" → HA_COMMAND: {{"type": "get_state", "entity_id": "group.salon_ve_kucukoda_petekler"}}
+- "Petekleri aç" → HA_COMMAND: {{"type": "service", "domain": "group", "service": "turn_on", "entity_id": "group.salon_ve_kucukoda_petekler", "data": {{}}}}
+- "Odayı 22 dereceye ayarla" → HA_COMMAND: {{"type": "service", "domain": "climate", "service": "set_temperature", "entity_id": "climate.oda", "data": {{"temperature": 22}}}}
 
 **Not:** Eğer entity bulunamazsa veya işlem Home Assistant ile ilgili değilse, sadece cevap ver, HA_COMMAND ekleme.
             """
+            
+            # If it's a state query, hint LLM to use get_state
+            if is_state_query:
+                system_prompt += "\n\n⚠️ BU MESAJ BİR SORU! Mutlaka type: \"get_state\" kullan, service çağrısı YAPMA!"
             
             # Generate response with HA integration (with retry)
             try:
