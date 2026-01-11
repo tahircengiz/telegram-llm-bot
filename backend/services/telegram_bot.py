@@ -203,12 +203,22 @@ class TelegramBotService:
         # Backward compatibility: support old format
         if "entities" in ha_command and not entity_id:
             entities = ha_command.get("entities", [])
-            action = ha_command.get("action")
-            if entities and action:
-                # Convert old format to new format
+            action = ha_command.get("action", "").lower() if ha_command.get("action") else ""
+            
+            # Actions that should be converted to get_state (read operations)
+            read_actions = ["get_state", "get_temperature", "read", "update", "check", "status", "state", "get"]
+            
+            if entities:
                 entity_id = entities[0]  # Take first entity
-                if action == "get_state" or not action or action == "":
+                
+                # Check if action is a read operation
+                if action in read_actions or not action or action == "":
+                    logger.info(f"Converting read action '{action}' to get_state for {entity_id}")
                     command_type = "get_state"
+                    ha_command = {
+                        "type": "get_state",
+                        "entity_id": entity_id
+                    }
                 else:
                     # Try to infer domain and service from action
                     domain = entity_id.split(".")[0] if "." in entity_id else "light"
@@ -224,41 +234,55 @@ class TelegramBotService:
                         ha_command["data"]["temperature"] = ha_command["temperature"]
                     command_type = "service"
         
-        if not entity_id:
+        # Support multiple entities (for backward compatibility with old format)
+        entities_to_process = []
+        if "entities" in ha_command and isinstance(ha_command["entities"], list):
+            # Multiple entities in old format
+            entities_to_process = ha_command["entities"]
+        elif entity_id:
+            # Single entity
+            entities_to_process = [entity_id]
+        
+        if not entities_to_process:
             error_messages.append("Entity ID bulunamadı")
             return bot_response, success_count, error_messages
         
         try:
             if command_type == "get_state":
-                # Read entity state
-                states = await self.ha_client.get_states(entity_id)
-                if states and len(states) > 0:
-                    state = states[0]
-                    state_value = state.get("state", "N/A")
-                    attributes = state.get("attributes", {})
-                    unit = attributes.get("unit_of_measurement", "")
-                    friendly_name = attributes.get("friendly_name", entity_id)
-                    
-                    if unit:
-                        value_str = f"{state_value} {unit}"
-                    else:
-                        value_str = str(state_value)
-                    
-                    # Update bot response with actual value
-                    if "**" in bot_response or "derece" in bot_response.lower() or "°" in bot_response:
-                        # Replace placeholder
-                        bot_response = re.sub(r'\*\*[\d.]+\*\*', f"**{state_value}**", bot_response)
-                        bot_response = re.sub(r'[\d.]+(?=\s*(derece|°|%))', state_value, bot_response)
-                        if unit and unit not in bot_response:
-                            bot_response = bot_response.replace(state_value, f"{state_value} {unit}")
-                    else:
-                        # Add value if not present
-                        bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
-                    
-                    logger.info(f"{'[DRY RUN] ' if dry_run else ''}Read state for {entity_id}: {value_str}")
-                    success_count += 1
-                else:
-                    error_messages.append(f"{entity_id}: Değer okunamadı")
+                # Read entity state(s)
+                for entity_id in entities_to_process:
+                    try:
+                        states = await self.ha_client.get_states(entity_id)
+                        if states and len(states) > 0:
+                            state = states[0]
+                            state_value = state.get("state", "N/A")
+                            attributes = state.get("attributes", {})
+                            unit = attributes.get("unit_of_measurement", "")
+                            friendly_name = attributes.get("friendly_name", entity_id)
+                            
+                            if unit:
+                                value_str = f"{state_value} {unit}"
+                            else:
+                                value_str = str(state_value)
+                            
+                            # Update bot response with actual value
+                            if "**" in bot_response or "derece" in bot_response.lower() or "°" in bot_response or "%" in bot_response:
+                                # Replace placeholder
+                                bot_response = re.sub(r'\*\*[\d.]+\*\*', f"**{state_value}**", bot_response)
+                                bot_response = re.sub(r'[\d.]+(?=\s*(derece|°|%))', state_value, bot_response)
+                                if unit and unit not in bot_response:
+                                    bot_response = bot_response.replace(state_value, f"{state_value} {unit}")
+                            else:
+                                # Add value if not present
+                                bot_response += f"\n\n📊 {friendly_name}: **{value_str}**"
+                            
+                            logger.info(f"{'[DRY RUN] ' if dry_run else ''}Read state for {entity_id}: {value_str}")
+                            success_count += 1
+                        else:
+                            error_messages.append(f"{entity_id}: Değer okunamadı")
+                    except Exception as e:
+                        logger.error(f"Error reading state for {entity_id}: {e}")
+                        error_messages.append(f"{entity_id}: {str(e)}")
                     
             elif command_type == "service":
                 # Generic service call
@@ -470,6 +494,7 @@ class TelegramBotService:
             
             # Check if message is a question requiring state read
             is_state_query = QuestionDetector.requires_state_read(user_message)
+            is_question = QuestionDetector.is_question(user_message)
             
             # Get entity list with state information
             entity_list = await self._get_enhanced_entity_list() if self.ha_client else "Home Assistant not configured"
@@ -505,9 +530,11 @@ Sen bir akıllı ev asistanısın. Kullanıcının mesajını anla ve Home Assis
 
 **ÖNEMLİ KURALLAR:**
 
-1. **Soru Tespiti:**
-   - Kullanıcı soru soruyorsa (?, kaç, nedir, açık mı, kapalı mı) → MUTLAKA type: "get_state" kullan
-   - "Açık mı?", "Kaç derece?", "Nedir?" gibi sorular için service çağrısı YAPMA, sadece state oku
+1. **Soru Tespiti (ÇOK ÖNEMLİ!):**
+   - Kullanıcı soru soruyorsa (?, kaç, nedir, açık mı, kapalı mı, merak ediyorum) → MUTLAKA type: "get_state" kullan
+   - "Açık mı?", "Kaç derece?", "Nedir?", "Merak ediyorum" gibi sorular için service çağrısı YAPMA, sadece state oku
+   - SORU SORULUYORSA: {"type": "get_state", "entity_id": "..."} formatını kullan
+   - ASLA "get_temperature", "update", "read" gibi action'lar kullanma - sadece "get_state"!
 
 2. **Entity Seçimi:**
    - Entity ID'leri yukarıdaki listeden tam olarak kullan
@@ -533,9 +560,12 @@ Sen bir akıllı ev asistanısın. Kullanıcının mesajını anla ve Home Assis
 **Not:** Eğer entity bulunamazsa veya işlem Home Assistant ile ilgili değilse, sadece cevap ver, HA_COMMAND ekleme.
             """
             
-            # If it's a state query, hint LLM to use get_state
-            if is_state_query:
-                system_prompt += "\n\n⚠️ BU MESAJ BİR SORU! Mutlaka type: \"get_state\" kullan, service çağrısı YAPMA!"
+            # If it's a question, strongly hint LLM to use get_state
+            if is_question or is_state_query:
+                system_prompt += "\n\n⚠️⚠️⚠️ BU MESAJ BİR SORU! ⚠️⚠️⚠️\n"
+                system_prompt += "MUTLAKA şu formatı kullan: HA_COMMAND: {\"type\": \"get_state\", \"entity_id\": \"sensor.xxx\"}\n"
+                system_prompt += "ASLA service çağrısı YAPMA! ASLA \"get_temperature\", \"update\", \"read\" gibi action kullanma!\n"
+                system_prompt += "SADECE: {\"type\": \"get_state\", \"entity_id\": \"...\"}"
             
             # Generate response with HA integration (with retry)
             try:
